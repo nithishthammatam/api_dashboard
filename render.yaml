@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: dashboard-api-python
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: PYTHON_VERSION
+        value: 3.9.18
+      - key: ALLOWED_ORIGINS
+        value: "*"
+      # You must add these manually in the Render Dashboard (Sensitive Data)
+      # - key: ALLOWED_KEYS
+      # - key: FIREBASE_PROJECT_ID
+      # - key: FIREBASE_CLIENT_EMAIL
+      # - key: FIREBASE_PRIVATE_KEY
+      # - key: FIREBASE_TOKEN_URI
