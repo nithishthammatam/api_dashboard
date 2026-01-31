@@ -1,6 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from typing import Optional, List, Dict, Any
 from database.firebase import db, init_error
+from datetime import datetime, timedelta
+from firebase_admin import firestore
 from middleware.auth import verify_api_key
 
 router = APIRouter(
@@ -37,6 +39,73 @@ async def get_all_users():
         }
     except Exception as e:
         print(f"❌ Error fetching users: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+@router.get("/users/status", response_model=Dict[str, Any])
+async def get_user_status():
+    """
+    Fetch all users and determine their active status.
+    Active: Synced screentime data in the last 5 days.
+    Inactive: No data synced in the last 5 days.
+    """
+    try:
+        if not db:
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Database connection not initialized. Error: {init_error}"
+            )
+
+        users_ref = db.collection("users")
+        docs = users_ref.stream()
+
+        users_status = []
+        
+        # Calculate 5 days ago date string
+        today = datetime.now()
+        five_days_ago = (today - timedelta(days=5)).strftime("%Y-%m-%d")
+
+        for doc in docs:
+            user_data = doc.to_dict()
+            user_id = doc.id
+            user_data["id"] = user_id
+            
+            # Check for recent activity
+            # Query screentime/{userId}/dates where document ID (date) >= five_days_ago
+            # We use limit(1) because finding even one record is enough to mark as active
+            screentime_dates_ref = db.collection("screentime").document(user_id).collection("dates")
+            
+            # Note: Firestore queries on document IDs are done via FieldPath.document_id()
+            # We use "__name__" string which represents the document ID field.
+            # However, when filtering by __name__, the value must be a full document path reference if we use the client SDKs in some contexts,
+            # OR we can just check string if we don't treat it as a reference.
+            # A common workaround that is robust verify simple string ID:
+            # We want to check if any document exists with ID >= five_days_ago.
+            # But ">= string" on __name__ often requires a Doc Ref.
+            # Let's try matching the exact path reference logic.
+            
+            # Construct a reference to a theoretical document at the start date
+            start_date_doc_ref = screentime_dates_ref.document(five_days_ago)
+
+            recent_activity = screentime_dates_ref.where(
+                "__name__", ">=", start_date_doc_ref
+            ).limit(1).stream()
+
+            # stream() returns a generator. We check if it yields any items.
+            is_active = False
+            for _ in recent_activity:
+                is_active = True
+                break
+            
+            user_data["status"] = "Active" if is_active else "Inactive"
+            users_status.append(user_data)
+
+        return {
+            "success": True,
+            "data": users_status,
+            "count": len(users_status)
+        }
+    except Exception as e:
+        print(f"❌ Error fetching user status: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
 @router.get("/screentime")
