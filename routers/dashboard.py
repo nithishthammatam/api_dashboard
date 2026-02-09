@@ -552,10 +552,6 @@ async def get_analytics():
                     total_screentime_month += stats["total_screentime_month"]
                     users_month += stats["users_month"]
                     
-                    total_sessions_month += stats["total_sessions_month"]
-                    total_screentime_month += stats["total_screentime_month"]
-                    users_month += stats["users_month"]
-                    
                     new_users_today += stats["new_users_today"]
                     
                 except Exception as exc:
