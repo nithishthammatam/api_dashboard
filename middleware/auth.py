@@ -7,7 +7,10 @@ load_dotenv()
 
 security_scheme = HTTPBearer()
 
-async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security_scheme)):
+async def verify_api_key(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(security_scheme)
+):
     """
     Middleware-like dependency to verify API Key.
     Uses HTTPBearer to automatically extract token and enable Swagger UI 'Authorize' button.

@@ -1,10 +1,14 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import dashboard
+from routers import dashboard, notifications
 import os
+import certifi
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Fix for SSL EOF error on Windows
+os.environ['SSL_CERT_FILE'] = certifi.where()
 
 app = FastAPI(
     title="TimeTrace Dashboard API",
@@ -31,6 +35,7 @@ app.add_middleware(
 
 # Include Routes
 app.include_router(dashboard.router)
+app.include_router(notifications.router)
 
 @app.get("/", tags=["General"])
 async def root():
