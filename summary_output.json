@@ -1,0 +1,17 @@
+{
+  "success": true,
+  "data": {
+    "total_users": 156,
+    "total_users_growth": 0.0,
+    "dau": 2,
+    "dau_change": -19,
+    "dau_change_percent": -90.48,
+    "wau": 58,
+    "wau_change": -7,
+    "wau_change_percent": -10.77,
+    "mau": 78,
+    "mau_change": 32,
+    "mau_change_percent": 69.57,
+    "last_updated": "2026-02-12T09:55:38.337023+00:00"
+  }
+}

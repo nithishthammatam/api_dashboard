@@ -602,3 +602,166 @@ async def get_analytics():
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal Server Error")
+
+@router.get("/summary", response_model=Dict[str, Any])
+async def get_summary():
+    """
+    Get summary statistics for the dashboard including:
+    - Total users and growth
+    - DAU (Daily Active Users) with change and percentage
+    - WAU (Weekly Active Users) with change and percentage
+    - MAU (Monthly Active Users) with change and percentage
+    """
+    try:
+        if not db:
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Database connection not initialized. Error: {init_error}"
+            )
+
+        # Define Dates in IST timezone
+        now_utc = datetime.now(timezone.utc)
+        ist_offset = timedelta(hours=5, minutes=30)
+        now_ist = now_utc + ist_offset
+        
+        # Current periods
+        today_str = now_ist.strftime("%Y-%m-%d")
+        week_start_str = (now_ist - timedelta(days=6)).strftime("%Y-%m-%d")
+        month_start_str = (now_ist - timedelta(days=29)).strftime("%Y-%m-%d")
+        
+        # Previous periods for comparison
+        yesterday_str = (now_ist - timedelta(days=1)).strftime("%Y-%m-%d")
+        prev_week_start_str = (now_ist - timedelta(days=13)).strftime("%Y-%m-%d")
+        prev_week_end_str = (now_ist - timedelta(days=7)).strftime("%Y-%m-%d")
+        prev_month_start_str = (now_ist - timedelta(days=59)).strftime("%Y-%m-%d")
+        prev_month_end_str = (now_ist - timedelta(days=30)).strftime("%Y-%m-%d")
+        
+        # Get all users
+        users_ref = db.collection("users")
+        all_users = list(users_ref.stream())
+        current_total_users = len(all_users)
+        
+        # Calculate previous total users (users created before today)
+        previous_total_users = 0
+        for user_doc in all_users:
+            user_created_utc = user_doc.create_time
+            if user_created_utc:
+                user_created_ist = user_created_utc + ist_offset
+                if user_created_ist.strftime("%Y-%m-%d") < today_str:
+                    previous_total_users += 1
+        
+        # Calculate total users growth
+        total_users_growth = 0
+        if previous_total_users > 0:
+            total_users_growth = ((current_total_users - previous_total_users) / previous_total_users) * 100
+        
+        # Initialize counters
+        dau_today = 0
+        dau_yesterday = 0
+        wau_current = 0
+        wau_previous = 0
+        mau_current = 0
+        mau_previous = 0
+        
+        # Process each user
+        for user_doc in all_users:
+            user_id = user_doc.id
+            
+            # Get screentime data
+            st_ref = db.collection("screentime").document(user_id).collection("dates")
+            st_docs = list(st_ref.stream())
+            
+            # Create a set of dates with activity
+            active_dates = set()
+            for date_doc in st_docs:
+                date_id = date_doc.id
+                data = date_doc.to_dict()
+                
+                # Check if there's actual data
+                apps_data = data.get("apps", [])
+                if apps_data:
+                    active_dates.add(date_id)
+            
+            # DAU - Today
+            if today_str in active_dates:
+                dau_today += 1
+            
+            # DAU - Yesterday
+            if yesterday_str in active_dates:
+                dau_yesterday += 1
+            
+            # WAU - Current week (last 7 days)
+            has_current_week_activity = False
+            for date_id in active_dates:
+                if week_start_str <= date_id <= today_str:
+                    has_current_week_activity = True
+                    break
+            if has_current_week_activity:
+                wau_current += 1
+            
+            # WAU - Previous week (7 days before current week)
+            has_previous_week_activity = False
+            for date_id in active_dates:
+                if prev_week_start_str <= date_id <= prev_week_end_str:
+                    has_previous_week_activity = True
+                    break
+            if has_previous_week_activity:
+                wau_previous += 1
+            
+            # MAU - Current month (last 30 days)
+            has_current_month_activity = False
+            for date_id in active_dates:
+                if month_start_str <= date_id <= today_str:
+                    has_current_month_activity = True
+                    break
+            if has_current_month_activity:
+                mau_current += 1
+            
+            # MAU - Previous month (30 days before current month)
+            has_previous_month_activity = False
+            for date_id in active_dates:
+                if prev_month_start_str <= date_id <= prev_month_end_str:
+                    has_previous_month_activity = True
+                    break
+            if has_previous_month_activity:
+                mau_previous += 1
+        
+        # Calculate changes
+        dau_change = dau_today - dau_yesterday
+        dau_change_percent = 0
+        if dau_yesterday > 0:
+            dau_change_percent = ((dau_today - dau_yesterday) / dau_yesterday) * 100
+        
+        wau_change = wau_current - wau_previous
+        wau_change_percent = 0
+        if wau_previous > 0:
+            wau_change_percent = ((wau_current - wau_previous) / wau_previous) * 100
+        
+        mau_change = mau_current - mau_previous
+        mau_change_percent = 0
+        if mau_previous > 0:
+            mau_change_percent = ((mau_current - mau_previous) / mau_previous) * 100
+        
+        return {
+            "success": True,
+            "data": {
+                "total_users": current_total_users,
+                "total_users_growth": round(total_users_growth, 2),
+                "dau": dau_today,
+                "dau_change": dau_change,
+                "dau_change_percent": round(dau_change_percent, 2),
+                "wau": wau_current,
+                "wau_change": wau_change,
+                "wau_change_percent": round(wau_change_percent, 2),
+                "mau": mau_current,
+                "mau_change": mau_change,
+                "mau_change_percent": round(mau_change_percent, 2),
+                "last_updated": now_ist.isoformat()
+            }
+        }
+    
+    except Exception as e:
+        print(f"❌ Error fetching summary: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Internal Server Error")
