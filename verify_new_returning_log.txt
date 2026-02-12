@@ -1,0 +1,84 @@
+Testing /api/dashboard/new-vs-returning?days=7...
+Fetching all date docs for New/Returning analysis...
+Processed 113 users history.
+SUCCESS
+{
+  "period": {
+    "start": "2026-02-06",
+    "end": "2026-02-12"
+  },
+  "data": [
+    {
+      "date": "2026-02-12",
+      "total_users": 13,
+      "new_users": 0,
+      "new_users_percent": 0.0,
+      "returning_users": 13,
+      "returning_users_percent": 100.0,
+      "day_of_week": "Thursday"
+    },
+    {
+      "date": "2026-02-11",
+      "total_users": 25,
+      "new_users": 0,
+      "new_users_percent": 0.0,
+      "returning_users": 25,
+      "returning_users_percent": 100.0,
+      "day_of_week": "Wednesday"
+    },
+    {
+      "date": "2026-02-10",
+      "total_users": 55,
+      "new_users": 0,
+      "new_users_percent": 0.0,
+      "returning_users": 55,
+      "returning_users_percent": 100.0,
+      "day_of_week": "Tuesday"
+    },
+    {
+      "date": "2026-02-09",
+      "total_users": 55,
+      "new_users": 2,
+      "new_users_percent": 3.6,
+      "returning_users": 53,
+      "returning_users_percent": 96.4,
+      "day_of_week": "Monday"
+    },
+    {
+      "date": "2026-02-08",
+      "total_users": 50,
+      "new_users": 1,
+      "new_users_percent": 2.0,
+      "returning_users": 49,
+      "returning_users_percent": 98.0,
+      "day_of_week": "Sunday"
+    },
+    {
+      "date": "2026-02-07",
+      "total_users": 47,
+      "new_users": 2,
+      "new_users_percent": 4.3,
+      "returning_users": 45,
+      "returning_users_percent": 95.7,
+      "day_of_week": "Saturday"
+    },
+    {
+      "date": "2026-02-06",
+      "total_users": 50,
+      "new_users": 0,
+      "new_users_percent": 0.0,
+      "returning_users": 50,
+      "returning_users_percent": 100.0,
+      "day_of_week": "Friday"
+    }
+  ],
+  "summary": {
+    "avg_new_percent": 1.4,
+    "avg_returning_percent": 98.6,
+    "new_user_trend": "decreasing",
+    "total_new_users": 5,
+    "total_returning_users": 290
+  }
+}
+
+Verified structure and calculation logic.

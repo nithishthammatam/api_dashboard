@@ -765,3 +765,565 @@ async def get_summary():
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal Server Error")
+
+@router.get("/dau-trend", response_model=Dict[str, Any])
+async def get_dau_trend(
+    days: int = Query(30, description="Number of days to look back (default 30)")
+):
+    """
+    Calculate Daily Active Users (DAU) trend.
+    DAU = count of unique userId values that have a document for that date.
+    """
+    try:
+        if not db:
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Database connection not initialized. Error: {init_error}"
+            )
+
+        # Define Dates in IST timezone
+        now_utc = datetime.now(timezone.utc)
+        ist_offset = timedelta(hours=5, minutes=30)
+        now_ist = now_utc + ist_offset
+        today = now_ist.date()
+        
+        # Calculate date range
+        end_date = today
+        start_date = end_date - timedelta(days=days-1) # Inclusive of today, so days-1
+        
+        start_date_str = start_date.strftime("%Y-%m-%d")
+        end_date_str = end_date.strftime("%Y-%m-%d")
+        
+        # Initialize storage for daily unique users
+        # Map: date_string -> set of user_ids
+        daily_users: Dict[str, set] = {}
+        
+        # Pre-populate dates to ensure all days are present even if 0 DAU
+        # And to filter later
+        target_dates = []
+        for i in range(days):
+            d = start_date + timedelta(days=i)
+            d_str = d.strftime("%Y-%m-%d")
+            daily_users[d_str] = set()
+            target_dates.append(d_str)
+
+        # Iterate all users to get their activity
+        # Note: This might be slow for very large user bases. 
+        # For scalability, we'd want a collection group query or pre-aggregated stats.
+        # Given the requirements and current structure, we iterate users -> dates.
+        users_ref = db.collection("users")
+        # Use simple stream, maybe limit fields if possible but we need IDs
+        user_docs = users_ref.stream()
+        
+        # Use ThreadPoolExecutor for concurrency if needed, but let's try sequential first 
+        # or reuse the pattern from other endpoints if performance is a concern.
+        # For aggregation, simpler is often better to start.
+        
+        # Let's collect all date docs relevant to the period
+        # Optimization: Use Collection Group Query?
+        # db.collection_group("dates") matches ALL collections named "dates".
+        # Structure is screentime/{userId}/dates/{date}
+        # If there are other "dates" collections, this might be risky.
+        # But efficiently: db.collection_group("dates").where("__name__", ">=", start_date_str).stream()
+        # This would give us ALL date docs from ALL users in one go.
+        # The parent of the date doc is the user's "dates" collection. 
+        # The parent of that is the user doc? No, screentime/{userId}. 
+        # So date_doc.reference.parent.parent.id would be the userId.
+        
+        # SAFE APPROACH described in Plan: Iterate users -> subcollections
+        # But to be faster, let's try the Collection Group query if we can filter by path? 
+        # Firestore doesn't easily filter by path in queries.
+        
+        # Let's stick to the reliable User iteration for now, matching `get_summary` logic.
+        
+        all_users = list(user_docs)
+        
+        for user_doc in all_users:
+            user_id = user_doc.id
+            
+            # Reference to screentime dates
+            dates_ref = db.collection("screentime").document(user_id).collection("dates")
+            
+            # Query only dates within range
+            # We can use document ID range queries on __name__
+            # This is very efficient.
+            start_date_doc = dates_ref.document(start_date_str)
+            end_date_doc = dates_ref.document(end_date_str)
+            query = dates_ref.where("__name__", ">=", start_date_doc).where("__name__", "<=", end_date_doc)
+            
+            # Projection: We only need the document ID (the date), no data.
+            # .select([]) extracts only the ID and creation/update time metadata, minimal bandwidth.
+            date_docs = query.select([]).stream()
+            
+            for date_doc in date_docs:
+                date_str = date_doc.id
+                if date_str in daily_users:
+                    daily_users[date_str].add(user_id)
+        
+        # Construct the response data
+        trend_data = []
+        previous_dau = 0
+        
+        # Summary stats tracking
+        total_dau_sum = 0
+        peak_dau = -1
+        peak_day_obj = None
+        lowest_dau = float('inf')
+        lowest_day_obj = None
+        
+        # Iterate in chronological order
+        for date_str in target_dates:
+            user_set = daily_users[date_str]
+            current_dau = len(user_set)
+            
+            # Date object for formatting
+            d_obj = datetime.strptime(date_str, "%Y-%m-%d")
+            
+            # Day of week (Python: Monday, Tuesday...)
+            day_of_week = d_obj.strftime("%A")
+            
+            # Is weekend? (Saturday=5, Sunday=6)
+            is_weekend = d_obj.weekday() >= 5
+            
+            # Change stats
+            change_from_prev = None
+            change_percent = None
+            
+            # We can calculate change for all except the very first day in the list
+            # Note: The very first day of the range has no "previous" in the range. 
+            # If we wanted strict change for the first day, we'd need to fetch day-1.
+            # Requirement says: "For each date in the last 30 days... This count = DAU"
+            # And "change_from_previous: Current day DAU - Previous day DAU"
+            # It implies using the previous day *in the series* or actual previous day?
+            # Usually in these charts, the first point has null change.
+            if date_str != start_date_str:
+                change_from_prev = current_dau - previous_dau
+                if previous_dau > 0:
+                    change_percent = (change_from_prev / previous_dau) * 100
+                else:
+                    change_percent = 0 if current_dau == 0 else 100.0 # 0 -> X is 100% growth effectively or infinite
+            
+            day_data = {
+                "date": date_str,
+                "dau": current_dau,
+                "day_of_week": day_of_week,
+                "change_from_previous": change_from_prev,
+                "change_percent": round(change_percent, 2) if change_percent is not None else None,
+                "is_weekend": is_weekend
+            }
+            trend_data.append(day_data)
+            
+            # Summary updates
+            total_dau_sum += current_dau
+            
+            if current_dau > peak_dau:
+                peak_dau = current_dau
+                peak_day_obj = {"date": date_str, "dau": current_dau, "day_of_week": day_of_week}
+            
+            if current_dau < lowest_dau:
+                lowest_dau = current_dau
+                lowest_day_obj = {"date": date_str, "dau": current_dau, "day_of_week": day_of_week}
+                
+            previous_dau = current_dau
+
+        # Final Summary
+        avg_dau = total_dau_sum / days if days > 0 else 0
+        
+        return {
+            "period": {
+                "start": start_date_str,
+                "end": end_date_str,
+                "total_days": days
+            },
+            "data": trend_data,
+            "summary": {
+                "avg_dau": round(avg_dau, 2),
+                "peak_day": peak_day_obj,
+                "lowest_day": lowest_day_obj
+            }
+        }
+
+    except Exception as e:
+        print(f"❌ Error fetching DAU trend: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+@router.get("/stickiness", response_model=Dict[str, Any])
+async def get_stickiness(
+    period: str = Query("30d", description="Period for historical trend (7d, 30d, 90d)")
+):
+    """
+    Calculate Stickiness Ratio (DAU/MAU * 100).
+    - DAU: Daily Active Users (Unique users with a date doc today)
+    - MAU: Monthly Active Users (Unique users with ANY date doc in last 30 days)
+    """
+    try:
+        if not db:
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Database connection not initialized. Error: {init_error}"
+            )
+
+        # Parse period
+        period_days = 30
+        if period == "7d": period_days = 7
+        elif period == "90d": period_days = 90
+        
+        # Define Dates (IST)
+        now_utc = datetime.now(timezone.utc)
+        ist_offset = timedelta(hours=5, minutes=30)
+        now_ist = now_utc + ist_offset
+        today = now_ist.date()
+        today_str = today.strftime("%Y-%m-%d")
+        
+        # Historical dates needs
+        # We need historical comparison points:
+        # - 7 days ago
+        # - 30 days ago
+        # - Array of points based on period
+        
+        # Calculate maximum lookback needed
+        # To calculate MAU for a date D, we need data from D-30 to D.
+        # Max historical point is today - period_days.
+        # Max lookback from there is (today - period_days) - 30.
+        # So overall window start: today - period_days - 30.
+        
+        # Actually, let's just fetch ALL dates for users and process in memory.
+        # It's cleaner given we iterate users anyway.
+        
+        users_ref = db.collection("users")
+        user_docs = users_ref.stream()
+        
+        # Map: date_string -> set of user_ids
+        daily_users: Dict[str, set] = {}
+        all_user_ids = set()
+        
+        # Iterate users
+        for user_doc in user_docs:
+            user_id = user_doc.id
+            all_user_ids.add(user_id)
+            
+            dates_ref = db.collection("screentime").document(user_id).collection("dates")
+            
+            # Fetch ALL dates. 
+            # Optimization: We could limit to dates >= (today - period_days - 60) 
+            # to cover 30d ago trend MAU window (30+30=60).
+            # Max lookback: 90d period -> 90 + 30 = 120 days.
+            lookback_days = period_days + 60 # Safe buffer for trends
+            min_date = today - timedelta(days=lookback_days)
+            min_date_doc = dates_ref.document(min_date.strftime("%Y-%m-%d"))
+            
+            try:
+                # Use document ID range query
+                date_docs = dates_ref.where("__name__", ">=", min_date_doc).select([]).stream()
+                
+                for d in date_docs:
+                    d_str = d.id
+                    if d_str not in daily_users:
+                        daily_users[d_str] = set()
+                    daily_users[d_str].add(user_id)
+            except Exception as e:
+                print(f"Error fetching dates for user {user_id}: {e}")
+                continue
+
+        # Helper to calculate Stickiness for a specific date
+        def calculate_stickiness_for_date(target_date_str):
+            target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
+            
+            # DAU: Users active ON target_date
+            dau_set = daily_users.get(target_date_str, set())
+            dau_count = len(dau_set)
+            
+            # MAU: Users active in [target_date - 29 days, target_date] (30 days total)
+            mau_set = set()
+            start_mau = target_date - timedelta(days=29)
+            
+            # Iterate dates in range to collect unique users
+            # Optimization: iterate 30 days
+            for i in range(30):
+                d = start_mau + timedelta(days=i)
+                d_str = d.strftime("%Y-%m-%d")
+                if d_str in daily_users:
+                    mau_set.update(daily_users[d_str])
+            
+            mau_count = len(mau_set)
+            
+            ratio = 0.0
+            if mau_count > 0:
+                ratio = (dau_count / mau_count) * 100
+                
+            return {
+                "date": target_date_str,
+                "dau": dau_count,
+                "mau": mau_count,
+                "ratio": round(ratio, 1)
+            }
+
+        # 1. Current Stickiness
+        current_stats = calculate_stickiness_for_date(today_str)
+        current_ratio = current_stats["ratio"]
+        
+        # 2. Trend: 7 days ago
+        date_7d_ago = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+        stats_7d = calculate_stickiness_for_date(date_7d_ago)
+        trend_7d = round(current_ratio - stats_7d["ratio"], 1)
+        
+        # 3. Trend: 30 days ago
+        date_30d_ago = (today - timedelta(days=30)).strftime("%Y-%m-%d")
+        stats_30d = calculate_stickiness_for_date(date_30d_ago)
+        trend_30d = round(current_ratio - stats_30d["ratio"], 1)
+        
+        # 4. Historical Data
+        historical_data = []
+        
+        # Determine interval based on period
+        step = 1 # Daily
+        if period == "30d": step = 7 # Weekly
+        if period == "90d": step = 7 # Weekly
+        
+        # Generate points
+        # For 30d/90d: every 7th day backwards from today
+        # For 7d: every day matches requirements?
+        # Req: "For 30d period: return ~4-5 data points (weekly intervals)"
+        
+        dates_to_plot = []
+        if period == "7d":
+            for i in range(7):
+                d = today - timedelta(days=6-i) # Last 7 days including today
+                dates_to_plot.append(d.strftime("%Y-%m-%d"))
+        else:
+            # Weekly snapshots
+            # Start from today and go back 'period_days' with step 7
+            # Actually, charts usually go Left->Right (Old->New)
+            # So start from (today - period) up to today?
+            # Or simplified: User said "return weekly snapshots (every 7th day)"
+            # Let's do: today, today-7, today-14... then reverse
+            curr = today
+            min_date = today - timedelta(days=period_days)
+            while curr > min_date:
+                dates_to_plot.append(curr.strftime("%Y-%m-%d"))
+                curr = curr - timedelta(days=7)
+            dates_to_plot.reverse() # Ascending order
+            
+        for d_str in dates_to_plot:
+            stats = calculate_stickiness_for_date(d_str)
+            historical_data.append({
+                "date": d_str,
+                "ratio": stats["ratio"]
+            })
+            
+        # 5. Status
+        status_str = "low_engagement"
+        if current_ratio >= 20: status_str = "high_engagement"
+        elif current_ratio >= 10: status_str = "moderate_engagement"
+        
+        return {
+            "current_ratio": current_ratio,
+            "target_ratio": 20.0,
+            "status": status_str,
+            "trend_7d": trend_7d,
+            "trend_30d": trend_30d,
+            "historical_data": historical_data,
+            "details": {
+                "dau": current_stats["dau"],
+                "mau": current_stats["mau"],
+                "calculation": f"{current_ratio}% = ({current_stats['dau']:,} / {current_stats['mau']:,}) × 100",
+                "period": period,
+                "generated_at": now_ist.isoformat()
+            }
+        }
+
+    except Exception as e:
+        print(f"❌ Error fetching Stickiness: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+@router.get("/new-vs-returning", response_model=Dict[str, Any])
+async def get_new_vs_returning(
+    days: int = Query(7, description="Number of days to analyze (e.g. 7, 14, 30)")
+):
+    """
+    Calculate New vs Returning Users breakdown.
+    - NEW USER: First ever activity date is TODAY.
+    - RETURNING USER: Active today, but first activity was BEFORE today.
+    """
+    try:
+        if not db:
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Database connection not initialized. Error: {init_error}"
+            )
+
+        # Define Dates (IST)
+        now_utc = datetime.now(timezone.utc)
+        ist_offset = timedelta(hours=5, minutes=30)
+        now_ist = now_utc + ist_offset
+        today = now_ist.date()
+        today_str = today.strftime("%Y-%m-%d")
+        
+        # Calculate date range
+        end_date = today
+        start_date = end_date - timedelta(days=days-1) # Inclusive
+        
+        # Step 1: Build User History Map & Daily Activity
+        # Efficiently query ALL dates using collection group query
+        # We need to know the *first* date for every user.
+        # Collection Group: "dates"
+        print(f"Fetching all date docs for New/Returning analysis...")
+        
+        # Optimization: We check if we can select only empty fields to save bandwidth
+        # We need: doc.id (date), parent.parent.id (userId)
+        # Note: In some SDKs/backends parent access might need document fetch.
+        # But usually doc ref is available from metadata.
+        all_date_docs = db.collection_group("dates").select([]).stream()
+        
+        user_first_seen: Dict[str, str] = {}
+        daily_active_users: Dict[str, set] = {}
+        
+        for doc in all_date_docs:
+            date_str = doc.id
+            # Parent of 'dates' collection is the user document
+            # Path: screentime/{userId}/dates/{date}
+            # doc.reference.parent = collection "dates"
+            # doc.reference.parent.parent = document "{userId}"
+            user_id = doc.reference.parent.parent.id
+            
+            # Track first seen
+            if user_id not in user_first_seen:
+                user_first_seen[user_id] = date_str
+            else:
+                if date_str < user_first_seen[user_id]:
+                    user_first_seen[user_id] = date_str
+            
+            # Track daily activity (only relevant for our query range, but building all is fine/fast for IDs)
+            if date_str not in daily_active_users:
+                daily_active_users[date_str] = set()
+            daily_active_users[date_str].add(user_id)
+            
+        print(f"Processed {len(user_first_seen)} users history.")
+
+        # Step 2: Calculate Daily Breakdown
+        breakdown_data = []
+        
+        total_new_sum = 0
+        total_returning_sum = 0
+        total_new_percent_sum = 0.0
+        days_with_data = 0
+        
+        # Iterate from start_date to end_date (inclusive)
+        # Sort descending (newest first) as per example? 
+        # Requirement example shows descending dates.
+        
+        target_dates = []
+        for i in range(days):
+            d = start_date + timedelta(days=i)
+            target_dates.append(d)
+        
+        # Process in chronological order for trend calculation, then reverse for response?
+        # Let's process chronological first.
+        chronological_data = []
+        
+        for d in target_dates:
+            d_str = d.strftime("%Y-%m-%d")
+            day_of_week = d.strftime("%A")
+            
+            active_users = daily_active_users.get(d_str, set())
+            total_active = len(active_users)
+            
+            new_count = 0
+            returning_count = 0
+            
+            if total_active > 0:
+                for uid in active_users:
+                    first_date = user_first_seen.get(uid)
+                    if first_date == d_str:
+                        new_count += 1
+                    elif first_date < d_str:
+                        returning_count += 1
+                    else:
+                        # Should not happen if logic is correct (active today means first_seen <= today)
+                        pass
+            
+            new_percent = 0.0
+            returning_percent = 0.0
+            
+            if total_active > 0:
+                new_percent = round((new_count / total_active) * 100, 1)
+                returning_percent = round((returning_count / total_active) * 100, 1)
+                # Ensure 100% total if needed, but rounding might make it 99.9 or 100.1. 
+                # Let's trust the calc or force returning = 100 - new?
+                # User req: "Ensure new_percent + returning_percent = 100.0"
+                if new_percent + returning_percent != 100.0:
+                    returning_percent = round(100.0 - new_percent, 1)
+            
+            # Accumulate for summary
+            total_new_sum += new_count
+            total_returning_sum += returning_count
+            # Only count active days for average percentages? 
+            # Or all days including 0? Usually all days in period.
+            total_new_percent_sum += new_percent
+            days_with_data += 1
+            
+            entry = {
+                "date": d_str,
+                "total_users": total_active,
+                "new_users": new_count,
+                "new_users_percent": new_percent,
+                "returning_users": returning_count,
+                "returning_users_percent": returning_percent,
+                "day_of_week": day_of_week
+            }
+            chronological_data.append(entry)
+
+        # Step 3: Summary & Trends
+        avg_new_percent = 0.0
+        if days_with_data > 0:
+            avg_new_percent = round(total_new_percent_sum / days_with_data, 1)
+        avg_returning_percent = round(100.0 - avg_new_percent, 1)
+        
+        # Trend: First half vs Second half
+        start_idx = 0
+        mid_idx = days // 2
+        
+        first_half = chronological_data[0:mid_idx]
+        second_half = chronological_data[mid_idx:]
+        
+        avg_first = 0.0
+        if first_half:
+            avg_first = sum(x["new_users_percent"] for x in first_half) / len(first_half)
+            
+        avg_second = 0.0
+        if second_half:
+            avg_second = sum(x["new_users_percent"] for x in second_half) / len(second_half)
+            
+        trend = "stable"
+        if avg_second > avg_first * 1.05: # 5% margin
+            trend = "increasing"
+        elif avg_second < avg_first * 0.95:
+            trend = "decreasing"
+            
+        # Sort data descending (newest first)
+        breakdown_data = sorted(chronological_data, key=lambda x: x["date"], reverse=True)
+        
+        return {
+            "period": {
+                "start": start_date.strftime("%Y-%m-%d"),
+                "end": end_date.strftime("%Y-%m-%d")
+            },
+            "data": breakdown_data,
+            "summary": {
+                "avg_new_percent": avg_new_percent,
+                "avg_returning_percent": avg_returning_percent,
+                "new_user_trend": trend,
+                "total_new_users": total_new_sum,
+                "total_returning_users": total_returning_sum
+            }
+        }
+
+    except Exception as e:
+        print(f"❌ Error fetching New vs Returning: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Internal Server Error")

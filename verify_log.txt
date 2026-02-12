@@ -1,0 +1,23 @@
+Testing /api/dashboard/dau-trend with days=30...
+C:\Users\THARUN\AppData\Local\Programs\Python\Python311\Lib\site-packages\google\cloud\firestore_v1\base_collection.py:316: UserWarning: Detected filter using positional arguments. Prefer using the 'filter' keyword argument instead.
+  return query.where(field_path, op_string, value)
+D:\TimeTrace\dashboard-api-python\routers\dashboard.py:852: UserWarning: Detected filter using positional arguments. Prefer using the 'filter' keyword argument instead.
+  query = dates_ref.where("__name__", ">=", start_date_doc).where("__name__", "<=", end_date_doc)
+SUCCESS
+{
+  "avg_dau": 26.97,
+  "peak_day": {
+    "date": "2026-02-09",
+    "dau": 55,
+    "day_of_week": "Monday"
+  },
+  "lowest_day": {
+    "date": "2026-01-15",
+    "dau": 3,
+    "day_of_week": "Thursday"
+  }
+}
+First day: {'date': '2026-01-14', 'dau': 5, 'day_of_week': 'Wednesday', 'change_from_previous': None, 'change_percent': None, 'is_weekend': False}
+Last day: {'date': '2026-02-12', 'dau': 3, 'day_of_week': 'Thursday', 'change_from_previous': -18, 'change_percent': -85.71, 'is_weekend': False}
+
+Verified structure and length.

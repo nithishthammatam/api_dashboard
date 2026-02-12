@@ -1,0 +1,42 @@
+Testing /api/dashboard/stickiness?period=30d...
+C:\Users\THARUN\AppData\Local\Programs\Python\Python311\Lib\site-packages\google\cloud\firestore_v1\base_collection.py:316: UserWarning: Detected filter using positional arguments. Prefer using the 'filter' keyword argument instead.
+  return query.where(field_path, op_string, value)
+SUCCESS
+{
+  "current_ratio": 16.7,
+  "target_ratio": 20.0,
+  "status": "moderate_engagement",
+  "trend_7d": -42.3,
+  "trend_30d": 3.7,
+  "historical_data": [
+    {
+      "date": "2026-01-15",
+      "ratio": 7.3
+    },
+    {
+      "date": "2026-01-22",
+      "ratio": 35.5
+    },
+    {
+      "date": "2026-01-29",
+      "ratio": 66.1
+    },
+    {
+      "date": "2026-02-05",
+      "ratio": 59.0
+    },
+    {
+      "date": "2026-02-12",
+      "ratio": 16.7
+    }
+  ],
+  "details": {
+    "dau": 13,
+    "mau": 78,
+    "calculation": "16.7% = (13 / 78) \u00d7 100",
+    "period": "30d",
+    "generated_at": "2026-02-12T11:35:09.839858+00:00"
+  }
+}
+
+Verified structure and calculation logic.
