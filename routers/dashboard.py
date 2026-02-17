@@ -3,14 +3,82 @@ from typing import Optional, List, Dict, Any, Tuple
 from database.firebase import db, init_error
 from datetime import datetime, timedelta, timezone
 from firebase_admin import firestore
+from google.cloud.firestore_v1.field_path import FieldPath
 from middleware.auth import verify_api_key
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
+
+try:
+    from cache import get_cached_data, set_cached_data
+except Exception as cache_import_error:
+    print(f"[cache] import unavailable: {cache_import_error}")
+
+    def get_cached_data(_key: str):
+        return None
+
+    def set_cached_data(_key: str, _data: Any, _ttl_minutes: int = 5) -> bool:
+        return False
 
 router = APIRouter(
     prefix="/api/dashboard",
     tags=["Dashboard"],
     dependencies=[Depends(verify_api_key)]
 )
+
+_DASHBOARD_CACHE_TTL_MIN = {
+    "users": 10,
+    "users_status": 5,
+    "screentime": 3,
+    "sessions": 3,
+    "analytics": 5,
+    "summary": 5,
+    "dau_trend": 10,
+    "stickiness": 10,
+    "new_vs_returning": 10,
+    "session_summary": 5,
+    "peak_usage_heatmap": 10,
+    "session_duration_distribution": 10,
+    "daily_usage_patterns": 10,
+}
+
+
+def _normalize_cache_value(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_normalize_cache_value(v) for v in value]
+    if isinstance(value, dict):
+        return {
+            str(k): _normalize_cache_value(v)
+            for k, v in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    return str(value)
+
+
+def _build_cache_key(endpoint_name: str, params: Optional[Dict[str, Any]] = None) -> str:
+    normalized_params = _normalize_cache_value(params or {})
+    params_json = json.dumps(normalized_params, sort_keys=True, separators=(",", ":"))
+    return f"dashboard:{endpoint_name}:{params_json}"
+
+
+def _cache_get(cache_key: str):
+    try:
+        cached = get_cached_data(cache_key)
+        if cached is not None:
+            print(f"[cache] HIT {cache_key}")
+        return cached
+    except Exception as cache_err:
+        print(f"[cache] read error key={cache_key}: {cache_err}")
+        return None
+
+
+def _cache_set(cache_key: str, payload: Any, ttl_minutes: int):
+    try:
+        cached_ok = set_cached_data(cache_key, payload, ttl_minutes=ttl_minutes)
+        if cached_ok:
+            print(f"[cache] SET {cache_key} ttl={ttl_minutes}m")
+    except Exception as cache_err:
+        print(f"[cache] write error key={cache_key}: {cache_err}")
 
 def process_user_stats(doc) -> Dict[str, Any]:
     """Helper function to process a single user's stats for /users endpoint"""
@@ -97,6 +165,11 @@ async def get_all_users():
                 detail=f"Database connection not initialized. Error: {init_error}"
             )
 
+        cache_key = _build_cache_key("users")
+        cached_response = _cache_get(cache_key)
+        if cached_response is not None:
+            return cached_response
+
         users_ref = db.collection("users")
         # specific to Python 3.7+ used in run_command tool?
         # stream() returns a generator, we need list to iterate or pass to executor
@@ -118,11 +191,13 @@ async def get_all_users():
                 except Exception as exc:
                     print(f"User processing generated an exception: {exc}")
 
-        return {
+        response_payload = {
             "success": True,
             "data": users,
             "count": len(users)
         }
+        _cache_set(cache_key, response_payload, _DASHBOARD_CACHE_TTL_MIN["users"])
+        return response_payload
     except Exception as e:
         print(f"❌ Error fetching users: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
@@ -139,6 +214,11 @@ async def get_user_status():
                 status_code=500, 
                 detail=f"Database connection not initialized. Error: {init_error}"
             )
+
+        cache_key = _build_cache_key("users_status")
+        cached_response = _cache_get(cache_key)
+        if cached_response is not None:
+            return cached_response
 
         users_ref = db.collection("users")
         docs = users_ref.stream() # Keep sequential as it's lighter (limit(1) query)
@@ -172,11 +252,13 @@ async def get_user_status():
             user_data["status"] = status_str
             users_status.append(user_data)
 
-        return {
+        response_payload = {
             "success": True,
             "data": users_status,
             "count": len(users_status)
         }
+        _cache_set(cache_key, response_payload, _DASHBOARD_CACHE_TTL_MIN["users_status"])
+        return response_payload
     except Exception as e:
         print(f"❌ Error fetching user status: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
@@ -193,6 +275,11 @@ async def get_screentime(
     try:
         if not db:
             raise HTTPException(status_code=500, detail="Database connection not initialized")
+
+        cache_key = _build_cache_key("screentime", {"userId": user_id, "date": date})
+        cached_response = _cache_get(cache_key)
+        if cached_response is not None:
+            return cached_response
 
         screentime_data = []
         
@@ -237,7 +324,7 @@ async def get_screentime(
                         data["date"] = d_doc.id
                         screentime_data.append(data)
 
-        return {
+        response_payload = {
             "success": True,
             "data": screentime_data,
             "count": len(screentime_data),
@@ -246,6 +333,8 @@ async def get_screentime(
                 "date": date or "all"
             }
         }
+        _cache_set(cache_key, response_payload, _DASHBOARD_CACHE_TTL_MIN["screentime"])
+        return response_payload
 
     except Exception as e:
         print(f"❌ Error fetching screentime: {e}")
@@ -259,6 +348,11 @@ async def get_sessions(
     try:
         if not db:
             raise HTTPException(status_code=500, detail="Database connection not initialized")
+
+        cache_key = _build_cache_key("sessions", {"userId": user_id, "date": date})
+        cached_response = _cache_get(cache_key)
+        if cached_response is not None:
+            return cached_response
 
         sessions_data = []
 
@@ -303,7 +397,7 @@ async def get_sessions(
                         data["date"] = d_doc.id
                         sessions_data.append(data)
 
-        return {
+        response_payload = {
             "success": True,
             "data": sessions_data,
             "count": len(sessions_data),
@@ -312,6 +406,8 @@ async def get_sessions(
                 "date": date or "all"
             }
         }
+        _cache_set(cache_key, response_payload, _DASHBOARD_CACHE_TTL_MIN["sessions"])
+        return response_payload
 
     except Exception as e:
         print(f"❌ Error fetching sessions: {e}")
@@ -484,6 +580,11 @@ async def get_analytics():
                 detail=f"Database connection not initialized. Error: {init_error}"
             )
 
+        cache_key = _build_cache_key("analytics")
+        cached_response = _cache_get(cache_key)
+        if cached_response is not None:
+            return cached_response
+
         # Calculate date ranges
         # Use simple date string comparison for efficiency.
         now = datetime.now()
@@ -564,7 +665,7 @@ async def get_analytics():
         hours_month = total_screentime_month / (1000 * 60 * 60) if total_screentime_month > 0 else 0
         hours_month = total_screentime_month / (1000 * 60 * 60) if total_screentime_month > 0 else 0
         
-        return {
+        response_payload = {
             "success": True,
             "data": {
                 "allTime": {
@@ -596,6 +697,8 @@ async def get_analytics():
                 "generatedAt": now.isoformat()
             }
         }
+        _cache_set(cache_key, response_payload, _DASHBOARD_CACHE_TTL_MIN["analytics"])
+        return response_payload
     
     except Exception as e:
         print(f"❌ Error fetching analytics: {e}")
@@ -618,6 +721,11 @@ async def get_summary():
                 status_code=500, 
                 detail=f"Database connection not initialized. Error: {init_error}"
             )
+
+        cache_key = _build_cache_key("summary")
+        cached_response = _cache_get(cache_key)
+        if cached_response is not None:
+            return cached_response
 
         # Define Dates in IST timezone
         now_utc = datetime.now(timezone.utc)
@@ -742,7 +850,7 @@ async def get_summary():
         if mau_previous > 0:
             mau_change_percent = ((mau_current - mau_previous) / mau_previous) * 100
         
-        return {
+        response_payload = {
             "success": True,
             "data": {
                 "total_users": current_total_users,
@@ -759,6 +867,8 @@ async def get_summary():
                 "last_updated": now_ist.isoformat()
             }
         }
+        _cache_set(cache_key, response_payload, _DASHBOARD_CACHE_TTL_MIN["summary"])
+        return response_payload
     
     except Exception as e:
         print(f"❌ Error fetching summary: {e}")
@@ -780,6 +890,11 @@ async def get_dau_trend(
                 status_code=500, 
                 detail=f"Database connection not initialized. Error: {init_error}"
             )
+
+        cache_key = _build_cache_key("dau_trend", {"days": days})
+        cached_response = _cache_get(cache_key)
+        if cached_response is not None:
+            return cached_response
 
         # Define Dates in IST timezone
         now_utc = datetime.now(timezone.utc)
@@ -929,7 +1044,7 @@ async def get_dau_trend(
         # Final Summary
         avg_dau = total_dau_sum / days if days > 0 else 0
         
-        return {
+        response_payload = {
             "period": {
                 "start": start_date_str,
                 "end": end_date_str,
@@ -942,6 +1057,8 @@ async def get_dau_trend(
                 "lowest_day": lowest_day_obj
             }
         }
+        _cache_set(cache_key, response_payload, _DASHBOARD_CACHE_TTL_MIN["dau_trend"])
+        return response_payload
 
     except Exception as e:
         print(f"❌ Error fetching DAU trend: {e}")
@@ -964,6 +1081,11 @@ async def get_stickiness(
                 status_code=500, 
                 detail=f"Database connection not initialized. Error: {init_error}"
             )
+
+        cache_key = _build_cache_key("stickiness", {"period": period})
+        cached_response = _cache_get(cache_key)
+        if cached_response is not None:
+            return cached_response
 
         # Parse period
         period_days = 30
@@ -1118,7 +1240,7 @@ async def get_stickiness(
         if current_ratio >= 20: status_str = "high_engagement"
         elif current_ratio >= 10: status_str = "moderate_engagement"
         
-        return {
+        response_payload = {
             "current_ratio": current_ratio,
             "target_ratio": 20.0,
             "status": status_str,
@@ -1133,6 +1255,8 @@ async def get_stickiness(
                 "generated_at": now_ist.isoformat()
             }
         }
+        _cache_set(cache_key, response_payload, _DASHBOARD_CACHE_TTL_MIN["stickiness"])
+        return response_payload
 
     except Exception as e:
         print(f"❌ Error fetching Stickiness: {e}")
@@ -1155,6 +1279,11 @@ async def get_new_vs_returning(
                 status_code=500, 
                 detail=f"Database connection not initialized. Error: {init_error}"
             )
+
+        cache_key = _build_cache_key("new_vs_returning", {"days": days})
+        cached_response = _cache_get(cache_key)
+        if cached_response is not None:
+            return cached_response
 
         # Define Dates (IST)
         now_utc = datetime.now(timezone.utc)
@@ -1307,7 +1436,7 @@ async def get_new_vs_returning(
         # Sort data descending (newest first)
         breakdown_data = sorted(chronological_data, key=lambda x: x["date"], reverse=True)
         
-        return {
+        response_payload = {
             "period": {
                 "start": start_date.strftime("%Y-%m-%d"),
                 "end": end_date.strftime("%Y-%m-%d")
@@ -1321,9 +1450,1257 @@ async def get_new_vs_returning(
                 "total_returning_users": total_returning_sum
             }
         }
+        _cache_set(cache_key, response_payload, _DASHBOARD_CACHE_TTL_MIN["new_vs_returning"])
+        return response_payload
 
     except Exception as e:
         print(f"❌ Error fetching New vs Returning: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+@router.get("/session-summary")
+async def get_session_summary(
+    target_date: Optional[str] = Query(None, alias="date", description="Target date (YYYY-MM-DD), defaults to today")
+):
+    """
+    Calculate session behavior summary metrics:
+    1. Average sessions per user per day
+    2. Average session duration
+    3. Session length distribution
+    """
+    try:
+        if not db:
+            raise HTTPException(status_code=500, detail="Database connection not initialized")
+
+        # Define IST timezone offset
+        ist_offset = timedelta(hours=5, minutes=30)
+        now_ist = datetime.now(timezone.utc) + ist_offset
+        
+        if not target_date:
+            target_date = now_ist.strftime("%Y-%m-%d")
+
+        cache_key = _build_cache_key("session_summary", {"date": target_date})
+        cached_response = _cache_get(cache_key)
+        if cached_response is not None:
+            return cached_response
+            
+        # Parse target date and get yesterday
+        target_dt = datetime.strptime(target_date, "%Y-%m-%d")
+        yesterday_str = (target_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        def get_metrics_for_date(date_str):
+            users_ref = db.collection("users")
+            user_docs = list(users_ref.stream())
+            
+            total_users = 0
+            total_sessions = 0
+            total_screentime = 0
+            session_durations = []
+
+            def process_user_date(user_doc):
+                user_id = user_doc.id
+                
+                # 1. Fetch Screentime
+                st_ref = db.collection("screentime").document(user_id).collection("dates").document(date_str)
+                st_doc = st_ref.get()
+                
+                # 2. Fetch Sessions for accurate count
+                sess_ref = db.collection("sessions").document(user_id).collection("dates").document(date_str)
+                sess_doc = sess_ref.get()
+                
+                user_sessions = 0
+                user_screentime = 0
+                
+                if st_doc.exists:
+                    st_data = st_doc.to_dict()
+                    # Root screentime is reliable
+                    user_screentime = float(str(st_data.get("totalScreenTime", 0)).replace(',', ''))
+                    
+                    # Try to get sessions from sessions collection first (more reliable)
+                    if sess_doc.exists:
+                        sess_data = sess_doc.to_dict()
+                        sessions_list = sess_data.get("sessions", [])
+                        if isinstance(sessions_list, list):
+                            user_sessions = len(sessions_list)
+                    
+                    # Fallback to totalSessions field in ST doc if still 0
+                    if user_sessions == 0:
+                        user_sessions = float(str(st_data.get("totalSessions", 0)).replace(',', ''))
+                        
+                    # Final fallback: sum apps if both are somehow 0 but apps exist
+                    if user_sessions == 0 or user_screentime == 0:
+                        apps = st_data.get("apps", [])
+                        if isinstance(apps, dict): apps = list(apps.values())
+                        if isinstance(apps, list):
+                            temp_sess = 0
+                            temp_st = 0
+                            for app in apps:
+                                if not isinstance(app, dict): continue
+                                try:
+                                    temp_sess += float(str(app.get("sessionCount", 0)).replace(',', ''))
+                                    temp_st += float(str(app.get("totalScreenTime", 0)).replace(',', ''))
+                                except (ValueError, TypeError): pass
+                            if user_sessions == 0: user_sessions = temp_sess
+                            if user_screentime == 0: user_screentime = temp_st
+
+                    if user_sessions > 0:
+                        return {
+                            "sessions": user_sessions,
+                            "screentime": user_screentime,
+                            "avg_duration": user_screentime / user_sessions
+                        }
+                return None
+
+            with ThreadPoolExecutor(max_workers=20) as executor:
+                results = list(executor.map(process_user_date, user_docs))
+
+            for res in results:
+                if res:
+                    total_users += 1
+                    total_sessions += res["sessions"]
+                    total_screentime += res["screentime"]
+                    session_durations.append(res["avg_duration"])
+
+            if total_users == 0:
+                return None
+
+            avg_sessions_per_user = total_sessions / total_users
+            avg_duration_ms = total_screentime / total_sessions
+            avg_duration_seconds = avg_duration_ms / 1000
+
+            # Distribution
+            short, medium, long, power = 0, 0, 0, 0
+            for d in session_durations:
+                if d < 60000: short += 1
+                elif d < 300000: medium += 1
+                elif d < 900000: long += 1
+                else: power += 1
+
+            distribution = {
+                "short_0_1min": round((short / total_users * 100), 1),
+                "medium_1_5min": round((medium / total_users * 100), 1),
+                "long_5_15min": round((long / total_users * 100), 1),
+                "power_15plus": round((power / total_users * 100), 1)
+            }
+
+            return {
+                "avg_sessions_per_user": avg_sessions_per_user,
+                "avg_duration_seconds": avg_duration_seconds,
+                "distribution": distribution,
+                "total_sessions": total_sessions,
+                "total_users": total_users
+            }
+
+        # Calculate for Today (Target)
+        today_metrics = get_metrics_for_date(target_date)
+        if not today_metrics:
+            response_payload = {
+                "success": True,
+                "message": f"No data found for {target_date}",
+                "date": target_date,
+                "data": None
+            }
+            _cache_set(cache_key, response_payload, _DASHBOARD_CACHE_TTL_MIN["session_summary"])
+            return response_payload
+
+        # Calculate for Yesterday
+        yesterday_metrics = get_metrics_for_date(yesterday_str)
+
+        # Calculate changes
+        sessions_change = 0
+        duration_change = 0
+        if yesterday_metrics:
+            sessions_change = today_metrics["avg_sessions_per_user"] - yesterday_metrics["avg_sessions_per_user"]
+            duration_change = today_metrics["avg_duration_seconds"] - yesterday_metrics["avg_duration_seconds"]
+
+        def format_duration(seconds):
+            seconds = int(round(seconds))
+            minutes = seconds // 60
+            secs = seconds % 60
+            return f"{minutes}m {secs}s"
+
+        response_payload = {
+            "date": target_date,
+            "avg_sessions_per_user": round(today_metrics["avg_sessions_per_user"], 1),
+            "avg_sessions_per_user_change": round(sessions_change, 2),
+            "avg_session_duration_seconds": int(round(today_metrics["avg_duration_seconds"])),
+            "avg_session_duration_formatted": format_duration(today_metrics["avg_duration_seconds"]),
+            "avg_duration_change_seconds": int(round(duration_change)),
+            "session_distribution": today_metrics["distribution"],
+            "total_sessions_today": today_metrics["total_sessions"],
+            "total_users_today": today_metrics["total_users"]
+        }
+        _cache_set(cache_key, response_payload, _DASHBOARD_CACHE_TTL_MIN["session_summary"])
+        return response_payload
+
+    except Exception as e:
+        print(f"ERROR: Error in get_session_summary: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _format_hour(hour: int) -> str:
+    hour = hour % 24
+    if hour == 0:
+        return "12am"
+    if hour == 12:
+        return "12pm"
+    if hour < 12:
+        return f"{hour}am"
+    return f"{hour - 12}pm"
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    if value is None:
+        return default
+    try:
+        return int(float(str(value).replace(",", "")))
+    except (ValueError, TypeError):
+        return default
+
+
+def _get_intensity(sessions: int, max_sessions: int) -> str:
+    if max_sessions <= 0:
+        return "low"
+
+    percent = sessions / max_sessions
+    if percent < 0.2:
+        return "low"
+    if percent < 0.5:
+        return "medium"
+    if percent < 0.8:
+        return "high"
+    return "peak"
+
+
+def _build_intensity_thresholds(max_sessions: int) -> Dict[str, Dict[str, Optional[int]]]:
+    if max_sessions <= 0:
+        return {
+            "low": {"min": 0, "max": 0},
+            "medium": {"min": 1, "max": 0},
+            "high": {"min": 1, "max": 0},
+            "peak": {"min": 1, "max": None},
+        }
+
+    low_max = int(max_sessions * 0.2)
+    medium_max = int(max_sessions * 0.5)
+    high_max = int(max_sessions * 0.8)
+
+    return {
+        "low": {"min": 0, "max": low_max},
+        "medium": {"min": low_max + 1, "max": medium_max},
+        "high": {"min": medium_max + 1, "max": high_max},
+        "peak": {"min": high_max + 1, "max": None},
+    }
+
+
+def _init_heatmap_matrix() -> Dict[int, Dict[int, int]]:
+    return {
+        day: {hour: 0 for hour in range(24)}
+        for day in range(7)
+    }
+
+
+def _fetch_user_dates_in_range(user_id: str, start_date_str: str, end_date_str: str):
+    """
+    Fetch date docs for a single user from screentime/{userId}/dates in date-id range.
+    Falls back to in-memory filtering per user if doc-id range query is unsupported.
+    """
+    user_dates_ref = db.collection("screentime").document(user_id).collection("dates")
+    start_doc_ref = user_dates_ref.document(start_date_str)
+    end_doc_ref = user_dates_ref.document(end_date_str)
+
+    try:
+        user_dates_query = (
+            user_dates_ref
+            .where(
+                filter=firestore.FieldFilter(
+                    "__name__", ">=", start_doc_ref
+                )
+            )
+            .where(
+                filter=firestore.FieldFilter(
+                    "__name__", "<=", end_doc_ref
+                )
+            )
+        )
+    except TypeError:
+        # Fallback for older Firestore clients
+        user_dates_query = (
+            user_dates_ref
+            .where("__name__", ">=", start_doc_ref)
+            .where("__name__", "<=", end_doc_ref)
+        )
+
+    try:
+        return list(user_dates_query.stream())
+    except Exception as range_query_err:
+        print(
+            "[getPeakUsageHeatmap] user-range query failed; using user-level in-memory "
+            f"filter for user={user_id}, error={range_query_err}"
+        )
+        return [
+            doc
+            for doc in user_dates_ref.stream()
+            if start_date_str <= doc.id <= end_date_str
+        ]
+
+
+def _aggregate_user_heatmap(
+    user_id: str,
+    start_date_str: str,
+    end_date_str: str
+) -> Tuple[Dict[int, Dict[int, int]], int, int]:
+    """
+    Aggregate heatmap contributions for one user.
+    Returns: (matrix, processed_date_docs, processed_app_rows)
+    """
+    user_matrix = _init_heatmap_matrix()
+    processed_docs = 0
+    processed_app_rows = 0
+
+    try:
+        date_docs = _fetch_user_dates_in_range(user_id, start_date_str, end_date_str)
+
+        for doc in date_docs:
+            processed_docs += 1
+            payload = doc.to_dict() or {}
+            apps = payload.get("apps", [])
+
+            # Handle missing/non-list apps gracefully
+            if isinstance(apps, dict):
+                apps = list(apps.values())
+            if not isinstance(apps, list):
+                continue
+
+            for app in apps:
+                if not isinstance(app, dict):
+                    continue
+
+                last_used_time = app.get("lastUsedTime")
+                if last_used_time in (None, ""):
+                    continue
+
+                ts_ms = _safe_int(last_used_time, default=-1)
+                if ts_ms < 0:
+                    continue
+
+                dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+                day_of_week = int(dt.strftime("%w"))  # 0=Sunday
+                hour = dt.hour
+
+                # sessionCount default = 1 when missing
+                sessions = _safe_int(app.get("sessionCount"), default=1)
+                if sessions < 0:
+                    sessions = 0
+
+                user_matrix[day_of_week][hour] += sessions
+                processed_app_rows += 1
+
+    except Exception as user_err:
+        print(
+            f"[getPeakUsageHeatmap] failed user aggregation user={user_id}, error={user_err}"
+        )
+
+    return user_matrix, processed_docs, processed_app_rows
+
+
+@router.get("/getPeakUsageHeatmap", response_model=Dict[str, Any])
+async def getPeakUsageHeatmap(
+    days: int = Query(30, description="Number of days to analyze", ge=1, le=365)
+):
+    """
+    Generate 7x24 heatmap of average sessions per day/hour from:
+    screentime/{userId}/dates/{dateString}
+    """
+    try:
+        if not db:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Database connection not initialized. Error: {init_error}"
+            )
+
+        cache_key = _build_cache_key("peak_usage_heatmap", {"days": days})
+        cached_response = _cache_get(cache_key)
+        if cached_response is not None:
+            return cached_response
+
+        # Step 1: Calculate date range (inclusive)
+        end_date = datetime.now(timezone.utc).date()
+        start_date = end_date - timedelta(days=days - 1)
+        start_date_str = start_date.strftime("%Y-%m-%d")
+        end_date_str = end_date.strftime("%Y-%m-%d")
+
+        print(
+            f"[getPeakUsageHeatmap] days={days}, start_date={start_date_str}, end_date={end_date_str}"
+        )
+
+        # Step 2: Count weekday occurrences in the period (0=Sunday)
+        day_counts = {i: 0 for i in range(7)}
+        for i in range(days):
+            d = end_date - timedelta(days=i)
+            day_counts[int(d.strftime("%w"))] += 1
+        print(f"[getPeakUsageHeatmap] day_counts={day_counts}")
+
+        # Step 3: Initialize 7x24 matrix
+        matrix = _init_heatmap_matrix()
+
+        # Step 4: Discover user ids from users collection and query each user's
+        # screentime/date range in parallel. We cannot rely on root screentime docs
+        # because subcollections may exist under missing parent documents.
+        try:
+            user_docs = list(db.collection("users").select([]).stream())
+        except Exception:
+            user_docs = list(db.collection("users").stream())
+
+        user_ids = [doc.id for doc in user_docs]
+
+        # Fallback: derive user ids from screentime date-doc parents if users collection
+        # is empty/unavailable.
+        if not user_ids:
+            print("[getPeakUsageHeatmap] users collection empty; deriving user ids from dates")
+            user_ids = list({
+                doc.reference.parent.parent.id
+                for doc in db.collection_group("dates").stream()
+                if doc.reference.parent.parent
+                and doc.reference.parent.parent.parent
+                and doc.reference.parent.parent.parent.id == "screentime"
+            })
+
+        print(f"[getPeakUsageHeatmap] candidate users={len(user_ids)}")
+
+        processed_screentime_docs = 0
+        processed_app_rows = 0
+
+        # Step 5: Aggregate sessions by day/hour
+        if user_ids:
+            max_workers = min(24, max(4, len(user_ids)))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(
+                        _aggregate_user_heatmap,
+                        user_id,
+                        start_date_str,
+                        end_date_str
+                    )
+                    for user_id in user_ids
+                ]
+
+                for future in as_completed(futures):
+                    user_matrix, user_doc_count, user_app_rows = future.result()
+                    processed_screentime_docs += user_doc_count
+                    processed_app_rows += user_app_rows
+
+                    for day in range(7):
+                        for hour in range(24):
+                            matrix[day][hour] += user_matrix[day][hour]
+
+        print(
+            f"[getPeakUsageHeatmap] processed_screentime_docs={processed_screentime_docs}, processed_app_rows={processed_app_rows}"
+        )
+
+        # Step 6: Calculate averages by weekday occurrence count
+        for day in range(7):
+            for hour in range(24):
+                matrix[day][hour] = (
+                    round(matrix[day][hour] / day_counts[day])
+                    if day_counts[day] > 0
+                    else 0
+                )
+
+        # Step 7: Find max for intensity calculation
+        max_value = 0
+        for day in range(7):
+            for hour in range(24):
+                if matrix[day][hour] > max_value:
+                    max_value = matrix[day][hour]
+        print(f"[getPeakUsageHeatmap] max_avg_sessions={max_value}")
+
+        # Step 8 + 9: Build data structure
+        day_names = [
+            "Sunday",
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
+        ]
+        data = []
+        all_slots = []
+
+        for day in range(7):
+            hourly_sessions = []
+            for hour in range(24):
+                avg_sessions = matrix[day][hour]
+                hourly_sessions.append(
+                    {
+                        "hour": hour,
+                        "avg_sessions": avg_sessions,
+                        "intensity": _get_intensity(avg_sessions, max_value),
+                    }
+                )
+                all_slots.append(
+                    {
+                        "day": day_names[day],
+                        "hour": hour,
+                        "avg_sessions": avg_sessions,
+                    }
+                )
+
+            data.append(
+                {
+                    "day_of_week": day_names[day],
+                    "day_index": day,
+                    "hourly_sessions": hourly_sessions,
+                }
+            )
+
+        # Step 10: Top 5 peak slots
+        top_slots = sorted(all_slots, key=lambda x: x["avg_sessions"], reverse=True)[:5]
+        peak_times = [
+            {
+                "day": slot["day"],
+                "hour": slot["hour"],
+                "avg_sessions": slot["avg_sessions"],
+                "formatted": (
+                    f"{slot['day']} "
+                    f"{_format_hour(slot['hour'])}-{_format_hour(slot['hour'] + 1)}"
+                ),
+            }
+            for slot in top_slots
+        ]
+
+        # Step 11: Bottom slots (for avoid-time recommendations)
+        bottom_slots = sorted(all_slots, key=lambda x: x["avg_sessions"])[:3]
+        avoid_slots = [
+            {
+                "day": slot["day"],
+                "hour": slot["hour"],
+                "avg_sessions": slot["avg_sessions"],
+                "formatted": (
+                    f"{slot['day']} "
+                    f"{_format_hour(slot['hour'])}-{_format_hour(slot['hour'] + 1)}"
+                ),
+            }
+            for slot in bottom_slots
+        ]
+
+        # Recommendation text blocks (same output shape requested)
+        best_times = [
+            f"{slot['day']} {_format_hour(slot['hour'])}-{_format_hour(slot['hour'] + 2)}"
+            for slot in top_slots[:2]
+        ]
+
+        hour_totals = {h: sum(matrix[d][h] for d in range(7)) for h in range(24)}
+        lowest_daily_hour = min(hour_totals, key=hour_totals.get) if hour_totals else 0
+        avoid_times = [
+            f"Daily {_format_hour(lowest_daily_hour)}-{_format_hour(lowest_daily_hour + 3)}"
+        ]
+        if avoid_slots:
+            avoid_times.append(
+                f"{avoid_slots[0]['day']} "
+                f"{_format_hour(avoid_slots[0]['hour'])}-{_format_hour(avoid_slots[0]['hour'] + 1)}"
+            )
+
+        response_payload = {
+            "period": f"last_{days}_days",
+            "data": data,
+            "peak_times": peak_times,
+            "intensity_thresholds": _build_intensity_thresholds(max_value),
+            "notification_recommendation": {
+                "best_times": best_times,
+                "avoid_times": avoid_times,
+            },
+        }
+
+        print("[getPeakUsageHeatmap] response generated successfully")
+        _cache_set(cache_key, response_payload, _DASHBOARD_CACHE_TTL_MIN["peak_usage_heatmap"])
+        return response_payload
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in getPeakUsageHeatmap: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+def _parse_yyyy_mm_dd(date_str: str, field_name: str):
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {field_name}. Expected format YYYY-MM-DD."
+        )
+
+
+def _avg_array_seconds(arr: List[float]) -> int:
+    if not arr:
+        return 0
+    return int(round(sum(arr) / len(arr)))
+
+
+def _format_duration(seconds: float) -> str:
+    total_seconds = int(round(seconds))
+    mins = total_seconds // 60
+    secs = total_seconds % 60
+    if mins == 0:
+        return f"{secs}s"
+    return f"{mins}m {secs}s"
+
+
+def _aggregate_user_session_duration_distribution(
+    user_id: str,
+    start_date_str: str,
+    end_date_str: str
+) -> Tuple[List[float], Dict[str, List[float]], int]:
+    durations: List[float] = []
+    bucket_durations: Dict[str, List[float]] = {
+        "short": [],
+        "medium": [],
+        "long": [],
+        "power": []
+    }
+    valid_user_days = 0
+
+    try:
+        date_docs = _fetch_user_dates_in_range(user_id, start_date_str, end_date_str)
+
+        for doc in date_docs:
+            payload = doc.to_dict() or {}
+            apps = payload.get("apps", [])
+
+            if isinstance(apps, dict):
+                apps = list(apps.values())
+            if not isinstance(apps, list):
+                continue
+
+            total_screen_time_ms = 0
+            total_sessions = 0
+
+            for app in apps:
+                if not isinstance(app, dict):
+                    continue
+
+                screen_time = _safe_int(app.get("totalScreenTime"), default=0)
+                session_count = _safe_int(app.get("sessionCount"), default=0)
+
+                if screen_time < 0:
+                    screen_time = 0
+                if session_count < 0:
+                    session_count = 0
+
+                total_screen_time_ms += screen_time
+                total_sessions += session_count
+
+            # Skip user-day with no sessions
+            if total_sessions == 0:
+                continue
+
+            avg_duration_seconds = (total_screen_time_ms / total_sessions) / 1000.0
+            durations.append(avg_duration_seconds)
+            valid_user_days += 1
+
+            if avg_duration_seconds < 60:
+                bucket_durations["short"].append(avg_duration_seconds)
+            elif avg_duration_seconds < 300:
+                bucket_durations["medium"].append(avg_duration_seconds)
+            elif avg_duration_seconds < 900:
+                bucket_durations["long"].append(avg_duration_seconds)
+            else:
+                bucket_durations["power"].append(avg_duration_seconds)
+
+    except Exception as user_err:
+        print(
+            "[getSessionDurationDistribution] failed user aggregation "
+            f"user={user_id}, error={user_err}"
+        )
+
+    return durations, bucket_durations, valid_user_days
+
+
+def _aggregate_user_daily_usage_patterns(
+    user_id: str,
+    start_date_str: str,
+    end_date_str: str
+) -> List[Tuple[str, int, int]]:
+    """
+    Returns per-date aggregates for a user:
+    [(date_str, total_sessions, total_screentime_ms), ...]
+    """
+    rows: List[Tuple[str, int, int]] = []
+
+    try:
+        date_docs = _fetch_user_dates_in_range(user_id, start_date_str, end_date_str)
+
+        for doc in date_docs:
+            payload = doc.to_dict() or {}
+            apps = payload.get("apps", [])
+
+            if isinstance(apps, dict):
+                apps = list(apps.values())
+            if not isinstance(apps, list):
+                apps = []
+
+            total_sessions = 0
+            total_screentime_ms = 0
+
+            for app in apps:
+                if not isinstance(app, dict):
+                    continue
+
+                sessions = _safe_int(app.get("sessionCount"), default=0)
+                screentime_ms = _safe_int(app.get("totalScreenTime"), default=0)
+
+                if sessions < 0:
+                    sessions = 0
+                if screentime_ms < 0:
+                    screentime_ms = 0
+
+                total_sessions += sessions
+                total_screentime_ms += screentime_ms
+
+            rows.append((doc.id, total_sessions, total_screentime_ms))
+
+    except Exception as user_err:
+        print(
+            "[getDailyUsagePatterns] failed user aggregation "
+            f"user={user_id}, error={user_err}"
+        )
+
+    return rows
+
+
+@router.get("/getSessionDurationDistribution", response_model=Dict[str, Any])
+async def getSessionDurationDistribution(
+    days: int = Query(30, description="Number of days to analyze", ge=1, le=3650),
+    start_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD), defaults to today")
+):
+    """
+    Calculate session duration distribution from:
+    screentime/{userId}/dates/{dateString}
+    """
+    try:
+        if not db:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Database connection not initialized. Error: {init_error}"
+            )
+
+        # Step 1: Calculate date range
+        resolved_end_date = (
+            _parse_yyyy_mm_dd(end_date, "end_date")
+            if end_date
+            else datetime.now(timezone.utc).date()
+        )
+        resolved_start_date = (
+            _parse_yyyy_mm_dd(start_date, "start_date")
+            if start_date
+            else (resolved_end_date - timedelta(days=days))
+        )
+
+        if resolved_start_date > resolved_end_date:
+            raise HTTPException(
+                status_code=400,
+                detail="start_date must be on or before end_date."
+            )
+
+        start_date_str = resolved_start_date.strftime("%Y-%m-%d")
+        end_date_str = resolved_end_date.strftime("%Y-%m-%d")
+        total_days = (resolved_end_date - resolved_start_date).days
+
+        cache_key = _build_cache_key(
+            "session_duration_distribution",
+            {
+                "start_date": start_date_str,
+                "end_date": end_date_str,
+                "days": days,
+            }
+        )
+        cached_response = _cache_get(cache_key)
+        if cached_response is not None:
+            return cached_response
+
+        print(
+            "[getSessionDurationDistribution] "
+            f"start={start_date_str}, end={end_date_str}, days_param={days}, total_days={total_days}"
+        )
+
+        # Discover candidate users from users collection first.
+        try:
+            user_docs = list(db.collection("users").select([]).stream())
+        except Exception:
+            user_docs = list(db.collection("users").stream())
+
+        user_ids = [doc.id for doc in user_docs]
+
+        # Fallback if users collection is empty.
+        if not user_ids:
+            print(
+                "[getSessionDurationDistribution] users collection empty; deriving user ids from dates"
+            )
+            user_ids = list({
+                doc.reference.parent.parent.id
+                for doc in db.collection_group("dates").stream()
+                if doc.reference.parent.parent
+                and doc.reference.parent.parent.parent
+                and doc.reference.parent.parent.parent.id == "screentime"
+            })
+
+        print(f"[getSessionDurationDistribution] candidate users={len(user_ids)}")
+
+        # Step 2+3: Query docs in range and compute user-day average durations.
+        all_durations: List[float] = []
+        bucket_durations: Dict[str, List[float]] = {
+            "short": [],
+            "medium": [],
+            "long": [],
+            "power": []
+        }
+        total_user_days = 0
+
+        if user_ids:
+            max_workers = min(24, max(4, len(user_ids)))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(
+                        _aggregate_user_session_duration_distribution,
+                        user_id,
+                        start_date_str,
+                        end_date_str
+                    )
+                    for user_id in user_ids
+                ]
+
+                for future in as_completed(futures):
+                    user_durations, user_buckets, user_days = future.result()
+                    all_durations.extend(user_durations)
+                    total_user_days += user_days
+
+                    for key in bucket_durations:
+                        bucket_durations[key].extend(user_buckets[key])
+
+        print(
+            "[getSessionDurationDistribution] "
+            f"total_user_days={total_user_days}, durations_collected={len(all_durations)}"
+        )
+
+        # Step 4: Calculate totals and percentages
+        counts = {
+            "short": len(bucket_durations["short"]),
+            "medium": len(bucket_durations["medium"]),
+            "long": len(bucket_durations["long"]),
+            "power": len(bucket_durations["power"])
+        }
+
+        def calc_percent(count: int) -> float:
+            if total_user_days == 0:
+                return 0.0
+            return round((count / total_user_days) * 100, 1)
+
+        percents = {
+            "short": calc_percent(counts["short"]),
+            "medium": calc_percent(counts["medium"]),
+            "long": calc_percent(counts["long"]),
+            "power": calc_percent(counts["power"])
+        }
+
+        # Step 5: Average duration per bucket
+        bucket_avgs = {
+            "short": _avg_array_seconds(bucket_durations["short"]),
+            "medium": _avg_array_seconds(bucket_durations["medium"]),
+            "long": _avg_array_seconds(bucket_durations["long"]),
+            "power": _avg_array_seconds(bucket_durations["power"])
+        }
+
+        # Step 6: Overall median and average
+        if all_durations:
+            sorted_durations = sorted(all_durations)
+            mid = len(sorted_durations) // 2
+            if len(sorted_durations) % 2 == 0:
+                median_seconds = (sorted_durations[mid - 1] + sorted_durations[mid]) / 2
+            else:
+                median_seconds = sorted_durations[mid]
+            avg_seconds = sum(all_durations) / len(all_durations)
+        else:
+            median_seconds = 0.0
+            avg_seconds = 0.0
+
+        median_seconds_rounded = int(round(median_seconds))
+        avg_seconds_rounded = int(round(avg_seconds))
+
+        # Step 8: Insights
+        insights = []
+        if percents["short"] > 40:
+            insights.append({
+                "type": "warning",
+                "message": f"{percents['short']}% are quick sessions - optimize app loading speed"
+            })
+
+        if percents["power"] < 10:
+            insights.append({
+                "type": "info",
+                "message": f"Only {percents['power']}% power sessions - consider adding deeper features"
+            })
+
+        if percents["medium"] > 30:
+            insights.append({
+                "type": "positive",
+                "message": f"{percents['medium']}% focused sessions shows strong task completion"
+            })
+
+        if percents["power"] > 20:
+            insights.append({
+                "type": "positive",
+                "message": f"{percents['power']}% power users - strong deep engagement!"
+            })
+
+        # Step 9: App type
+        app_type = "balanced"
+        if percents["short"] > 50:
+            app_type = "quick_check"
+        elif percents["power"] > 20:
+            app_type = "deep_engagement"
+        elif percents["medium"] > 40:
+            app_type = "utility"
+
+        response_payload = {
+            "date_range": {
+                "start": start_date_str,
+                "end": end_date_str,
+                "total_days": total_days
+            },
+            "total_user_days_analyzed": total_user_days,
+            "distribution": [
+                {
+                    "bucket": "0-1min",
+                    "count": counts["short"],
+                    "percent": percents["short"],
+                    "label": "Quick Check",
+                    "description": "Just checking notifications or quick task",
+                    "avg_duration_seconds": bucket_avgs["short"],
+                    "color": "#DBEAFE"
+                },
+                {
+                    "bucket": "1-5min",
+                    "count": counts["medium"],
+                    "percent": percents["medium"],
+                    "label": "Focused Use",
+                    "description": "Completing a specific task or goal",
+                    "avg_duration_seconds": bucket_avgs["medium"],
+                    "color": "#93C5FD"
+                },
+                {
+                    "bucket": "5-15min",
+                    "count": counts["long"],
+                    "percent": percents["long"],
+                    "label": "Deep Browse",
+                    "description": "Exploring content or discovery mode",
+                    "avg_duration_seconds": bucket_avgs["long"],
+                    "color": "#3B82F6"
+                },
+                {
+                    "bucket": "15+min",
+                    "count": counts["power"],
+                    "percent": percents["power"],
+                    "label": "Power Users",
+                    "description": "Heavy engagement or content creation",
+                    "avg_duration_seconds": bucket_avgs["power"],
+                    "color": "#1D4ED8"
+                }
+            ],
+            "overall": {
+                "median_duration_seconds": median_seconds_rounded,
+                "median_duration_formatted": _format_duration(median_seconds_rounded),
+                "avg_duration_seconds": avg_seconds_rounded,
+                "avg_duration_formatted": _format_duration(avg_seconds_rounded)
+            },
+            "insights": insights,
+            "app_type": app_type
+        }
+
+        print("[getSessionDurationDistribution] response generated successfully")
+        _cache_set(
+            cache_key,
+            response_payload,
+            _DASHBOARD_CACHE_TTL_MIN["session_duration_distribution"]
+        )
+        return response_payload
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in getSessionDurationDistribution: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+@router.get("/getDailyUsagePatterns", response_model=Dict[str, Any])
+async def getDailyUsagePatterns(
+    days: int = Query(30, description="Number of days to analyze", ge=1, le=3650)
+):
+    """
+    Analyze usage patterns by day of week from:
+    screentime/{userId}/dates/{dateString}
+    """
+    try:
+        if not db:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Database connection not initialized. Error: {init_error}"
+            )
+
+        # Step 1: Calculate date range
+        end_date = datetime.now(timezone.utc).date()
+        start_date = end_date - timedelta(days=days - 1)
+        start_date_str = start_date.strftime("%Y-%m-%d")
+        end_date_str = end_date.strftime("%Y-%m-%d")
+
+        cache_key = _build_cache_key(
+            "daily_usage_patterns",
+            {"days": days, "start_date": start_date_str, "end_date": end_date_str}
+        )
+        cached_response = _cache_get(cache_key)
+        if cached_response is not None:
+            return cached_response
+
+        print(
+            "[getDailyUsagePatterns] "
+            f"days={days}, start={start_date_str}, end={end_date_str}"
+        )
+
+        # Step 2+3: Build per-date aggregate first
+        by_date: Dict[str, Dict[str, Any]] = {}
+
+        try:
+            user_docs = list(db.collection("users").select([]).stream())
+        except Exception:
+            user_docs = list(db.collection("users").stream())
+
+        user_ids = [doc.id for doc in user_docs]
+        if not user_ids:
+            print("[getDailyUsagePatterns] users collection empty; deriving user ids from dates")
+            user_ids = list({
+                doc.reference.parent.parent.id
+                for doc in db.collection_group("dates").stream()
+                if doc.reference.parent.parent
+                and doc.reference.parent.parent.parent
+                and doc.reference.parent.parent.parent.id == "screentime"
+            })
+
+        print(f"[getDailyUsagePatterns] candidate users={len(user_ids)}")
+
+        if user_ids:
+            max_workers = min(24, max(4, len(user_ids)))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_user = {
+                    executor.submit(
+                        _aggregate_user_daily_usage_patterns,
+                        user_id,
+                        start_date_str,
+                        end_date_str
+                    ): user_id
+                    for user_id in user_ids
+                }
+
+                for future in as_completed(future_to_user):
+                    rows = future.result()
+                    user_id = future_to_user[future]
+
+                    for date_str, sessions, screentime_ms in rows:
+                        if date_str not in by_date:
+                            by_date[date_str] = {
+                                "users": set(),
+                                "totalSessions": 0,
+                                "totalScreenTime": 0
+                            }
+
+                        by_date[date_str]["users"].add(user_id)
+                        by_date[date_str]["totalSessions"] += sessions
+                        by_date[date_str]["totalScreenTime"] += screentime_ms
+
+        print(f"[getDailyUsagePatterns] unique_dates={len(by_date)}")
+
+        # Step 4: Initialize grouped structure
+        day_names = [
+            "Sunday", "Monday", "Tuesday", "Wednesday",
+            "Thursday", "Friday", "Saturday"
+        ]
+        grouped: Dict[int, Dict[str, Any]] = {
+            i: {"name": day_names[i], "index": i, "dateEntries": []}
+            for i in range(7)
+        }
+
+        # Step 5: Add dates to day groups
+        for date_str, data in by_date.items():
+            date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+            day_of_week = (date_obj.weekday() + 1) % 7  # convert to JS-like 0=Sunday
+            grouped[day_of_week]["dateEntries"].append({
+                "date": date_str,
+                "sessions": data["totalSessions"],
+                "users": len(data["users"]),
+                "screentime": data["totalScreenTime"]
+            })
+
+        # Step 6: Calculate per-day averages
+        results: List[Dict[str, Any]] = []
+
+        for i in range(7):
+            day = grouped[i]
+            entries = day["dateEntries"]
+
+            if len(entries) == 0:
+                results.append({
+                    "day_of_week": day["name"],
+                    "day_index": i,
+                    "avg_sessions": 0,
+                    "avg_dau": 0,
+                    "sessions_per_user": 0,
+                    "avg_duration_seconds": 0,
+                    "avg_duration_formatted": "0s",
+                    "occurrences": 0,
+                    "is_peak": False,
+                    "vs_avg_percent": 0
+                })
+                continue
+
+            count = len(entries)
+            avg_sessions = round(sum(e["sessions"] for e in entries) / count)
+            avg_users = round(sum(e["users"] for e in entries) / count)
+
+            total_screentime_ms = sum(e["screentime"] for e in entries)
+            total_sessions_all = sum(e["sessions"] for e in entries)
+
+            avg_duration_sec = (
+                round((total_screentime_ms / 1000) / total_sessions_all)
+                if total_sessions_all > 0
+                else 0
+            )
+
+            sessions_per_user = (
+                round(avg_sessions / avg_users, 2)
+                if avg_users > 0
+                else 0
+            )
+
+            results.append({
+                "day_of_week": day["name"],
+                "day_index": i,
+                "avg_sessions": avg_sessions,
+                "avg_dau": avg_users,
+                "sessions_per_user": sessions_per_user,
+                "avg_duration_seconds": avg_duration_sec,
+                "avg_duration_formatted": _format_duration(avg_duration_sec),
+                "occurrences": count,
+                "is_peak": False,
+                "vs_avg_percent": 0
+            })
+
+        # Step 7: Overall average and vs_avg_percent
+        days_with_data = [d for d in results if d["avg_sessions"] > 0]
+        overall_avg = (
+            round(sum(d["avg_sessions"] for d in days_with_data) / len(days_with_data))
+            if days_with_data
+            else 0
+        )
+
+        for day in results:
+            if day["avg_sessions"] > 0 and overall_avg > 0:
+                day["vs_avg_percent"] = round(
+                    ((day["avg_sessions"] - overall_avg) / overall_avg) * 100,
+                    1
+                )
+
+        # Step 8: Peak and lowest days
+        if days_with_data:
+            sorted_by_session = sorted(days_with_data, key=lambda x: x["avg_sessions"], reverse=True)
+            peak_day = sorted_by_session[0]
+            lowest_day = sorted_by_session[-1]
+
+            for day in results:
+                if day["day_of_week"] == peak_day["day_of_week"]:
+                    day["is_peak"] = True
+                    break
+        else:
+            peak_day = {"day_of_week": "Sunday", "avg_sessions": 0, "day_index": 0}
+            lowest_day = {"day_of_week": "Sunday", "avg_sessions": 0, "day_index": 0}
+
+        # Step 9: Weekday vs weekend
+        weekdays = [d for d in results if 1 <= d["day_index"] <= 5]
+        weekends = [d for d in results if d["day_index"] in (0, 6)]
+
+        weekday_avg = round(sum(d["avg_sessions"] for d in weekdays) / len(weekdays)) if weekdays else 0
+        weekend_avg = round(sum(d["avg_sessions"] for d in weekends) / len(weekends)) if weekends else 0
+        weekday_higher_percent = (
+            round(((weekday_avg - weekend_avg) / weekend_avg) * 100, 1)
+            if weekend_avg > 0
+            else 0
+        )
+
+        # Step 10: Insights
+        insights: List[Dict[str, str]] = []
+        insights.append({
+            "type": "positive",
+            "message": f"{peak_day['day_of_week']} is peak day - best day to launch new features"
+        })
+        insights.append({
+            "type": "info",
+            "message": f"Weekday engagement {weekday_higher_percent}% higher than weekends"
+        })
+
+        weekday_duration = round(
+            sum(d["avg_duration_seconds"] for d in weekdays) / len(weekdays)
+        ) if weekdays else 0
+        weekend_duration = round(
+            sum(d["avg_duration_seconds"] for d in weekends) / len(weekends)
+        ) if weekends else 0
+
+        if weekend_duration > weekday_duration:
+            insights.append({
+                "type": "info",
+                "message": "Weekend sessions are longer - users have more free time"
+            })
+
+        response_payload = {
+            "period": f"last_{days}_days",
+            "total_days_analyzed": days,
+            "data": results,
+            "summary": {
+                "overall_avg_sessions": overall_avg,
+                "peak_day": {
+                    "day": peak_day["day_of_week"],
+                    "avg_sessions": peak_day["avg_sessions"],
+                    "day_index": peak_day["day_index"]
+                },
+                "lowest_day": {
+                    "day": lowest_day["day_of_week"],
+                    "avg_sessions": lowest_day["avg_sessions"],
+                    "day_index": lowest_day["day_index"]
+                },
+                "weekday_vs_weekend": {
+                    "weekday_avg_sessions": weekday_avg,
+                    "weekend_avg_sessions": weekend_avg,
+                    "weekday_higher_percent": weekday_higher_percent
+                }
+            },
+            "insights": insights
+        }
+
+        print("[getDailyUsagePatterns] response generated successfully")
+        _cache_set(cache_key, response_payload, _DASHBOARD_CACHE_TTL_MIN["daily_usage_patterns"])
+        return response_payload
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in getDailyUsagePatterns: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal Server Error")
