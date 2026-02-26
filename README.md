@@ -7,6 +7,7 @@ It provides the same endpoints as the Node.js version but includes interactive d
 - **FastAPI**: High performance, easy to use.
 - **Interactive Docs**: Swagger UI available at `/docs`.
 - **Firebase Admin**: Secure access to Firestore.
+- **Persistent Fast Cache**: Dashboard API responses are cached in Redis and materialized in Firestore for fast cold-start reads.
 - **Railway Ready**: Configured for easy deployment.
 
 ## Setup
@@ -49,3 +50,24 @@ It provides the same endpoints as the Node.js version but includes interactive d
 - `GET /api/dashboard/users`
 - `GET /api/dashboard/screentime`
 - `GET /api/dashboard/sessions`
+
+## Fast Path Warmup
+To precompute Firestore snapshots used by high-cost analytics endpoints:
+
+```bash
+python precompute_fastpath.py --days 7 --weeks 8,12
+```
+
+This warms pre-aggregated fast paths for:
+- `/api/dashboard/getUserSegments`
+- `/api/dashboard/getWellbeingReport`
+- `/api/dashboard/getCohortRetention`
+
+All dashboard endpoints also use an automatic persistent cache collection:
+- `dashboard_preagg_cache`
+
+To warm cache for all dashboard APIs in one run:
+
+```bash
+python warm_dashboard_cache.py --days 30 --weeks 8,12 --top-limit 10
+```

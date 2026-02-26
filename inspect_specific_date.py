@@ -7,7 +7,7 @@ import json
 
 load_dotenv()
 
-def inspect_exact_date(user_id="1MD8QR", date_str="2026-02-05"):
+def inspect_exact_date(user_id="1MD8QR", date_str="2026-02-06"):
     print(f"Inspecting Data for User: {user_id} on Date: {date_str}")
     
     # Init Firestore
@@ -34,6 +34,9 @@ def inspect_exact_date(user_id="1MD8QR", date_str="2026-02-05"):
     print("\n--- SCREENTIME COLLECTION ---")
     if st_doc.exists:
         data = st_doc.to_dict()
+        print(f"Document Keys: {list(data.keys())}")
+        print(f"Root totalScreenTime: {data.get('totalScreenTime')}")
+        print(f"Root totalSessions: {data.get('totalSessions')}")
         apps = data.get("apps", [])
         apps_list = apps if isinstance(apps, list) else list(apps.values()) if isinstance(apps, dict) else []
         
@@ -48,12 +51,13 @@ def inspect_exact_date(user_id="1MD8QR", date_str="2026-02-05"):
         print(f"totalScreenTime (calculated from apps): {total_st_ms} ms ({hours:.2f} hours)")
         print(f"Number of Apps: {len(apps_list)}")
         
-        # Print top 3 apps for proof
-        sorted_apps = sorted(apps_list, key=lambda x: float(str(x.get("totalScreenTime", 0)).replace(',', '')), reverse=True)[:3]
+        # Print top 5 apps for proof
+        sorted_apps = sorted(apps_list, key=lambda x: float(str(x.get("totalScreenTime", 0)).replace(',', '')), reverse=True)[:5]
         for app in sorted_apps:
             name = app.get("appName", "Unknown")
             st = app.get("totalScreenTime", 0)
-            print(f"  - {name}: {st}")
+            sc = app.get("sessionCount", 0)
+            print(f"  - {name}: ST={st}, SC={sc}")
             
     else:
         print("Document DOES NOT exist.")
@@ -65,6 +69,10 @@ def inspect_exact_date(user_id="1MD8QR", date_str="2026-02-05"):
         count = len(sessions) if isinstance(sessions, list) else 0
         print(f"Document EXISTS.")
         print(f"Session List Count: {count}")
+        if count > 0:
+            print("First 3 Sessions:")
+            for s in sessions[:3]:
+                print(f"  - {s}")
     else:
         print("Document DOES NOT exist.")
 

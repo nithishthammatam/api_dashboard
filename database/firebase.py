@@ -23,12 +23,12 @@ def initialize_firebase():
     # Method 1: Secret File (Production/Render/Railway)
     service_account_path = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH")
     if service_account_path and os.path.exists(service_account_path):
-        print(f"🔐 Loading credentials from secret file: {service_account_path}")
+        print(f"[firebase] Loading credentials from secret file: {service_account_path}")
         cred = credentials.Certificate(service_account_path)
     
     # Method 2: Environment Variables (Development/Fallback)
     else:
-        print("🔧 Using environment variables method")
+        print("[firebase] Using environment variables method")
         
         private_key = os.getenv("FIREBASE_PRIVATE_KEY")
         client_email = os.getenv("FIREBASE_CLIENT_EMAIL")
@@ -50,7 +50,7 @@ def initialize_firebase():
         
         # Ensure correct header/footer
         if "-----BEGIN PRIVATE KEY-----" not in private_key:
-             print("⚠️ WARNING: Private key missing header")
+             print("[firebase] WARNING: Private key missing header")
 
         cred = credentials.Certificate({
             "type": "service_account",
@@ -62,16 +62,16 @@ def initialize_firebase():
 
     try:
         app = firebase_admin.initialize_app(cred)
-        print(f"✅ Firebase Admin SDK initialized successfully: {app.name}")
+        print(f"[firebase] Firebase Admin SDK initialized successfully: {app.name}")
     except ValueError as ve:
-        print(f"❌ Firebase initialization ValueError: {ve}")
+        print(f"[firebase] Firebase initialization ValueError: {ve}")
         # If the app is already initialized, we can ignore this
         if "The default Firebase app already exists" in str(ve):
              print("   (App already existed, continuing)")
         else:
              raise ve
     except Exception as e:
-        print(f"❌ Firebase initialization failed: {type(e).__name__}: {e}")
+        print(f"[firebase] Firebase initialization failed: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
         raise e

@@ -1,0 +1,8 @@
+User 018M18: keys=['fcmToken'], token=c25uCeBYTiya3v-LB5cNbP:APA91bEWkhdUUvQbH-10Cll7y6iBCkmJqD3DnkW7lmOeyzi1rmZRdqLj5YmWCh0cJRA4Bly9F5jYujJESRhUoT-THuiQ_BxARCLpOf5aCpKjEpY2TbDye6k
+User 05DTSD: keys=['fcmToken'], token=eSG8ky74T8W4xRnDImL6sJ:APA91bEwpFbisOOy4KtDzqQ1WSkA8Yp49MiMOZUEpdRaCNQSV1cIZjSvwlJ9F18WdIKhusGxmXX4SI5r0SVSh8-1sOZag_mA8tUAEPln51nXqqb-42u-Nnw
+User 07YTX9: keys=[], token=None
+User 09OC11: keys=['fcmToken'], token=e2iGIjp5QyKFzW75AFyzv8:APA91bEGkic1R-GKrL7dF7SO0XT9iOKt-ApOl-BU4PWOE6485R3FCtxq4SkHGzA5_sdbEZGQixpzL0rAHOqpy5pIDa_a0HZEkyx8jq5Ak8LtEpcLApIDujY
+User 09OQBV: keys=[], token=None
+
+Total Docs Scanned: 156
+Total Tokens Found: 116

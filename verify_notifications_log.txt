@@ -1,0 +1,35 @@
+Testing POST /api/notifications/send-all...
+❌ Batch send error: Unknown error while making a remote service call: EOF occurred in violation of protocol (_ssl.c:2427)
+POST SUCCESS
+{
+  "success": true,
+  "message": "Notification sent. Success: 0, Failed: 116",
+  "id": "htflscSq2chRZf3dsUzN",
+  "recipient_count": 116,
+  "success_count": 0,
+  "failure_count": 116
+}
+ℹ️ Attempted to send to 116 tokens
+
+Testing GET /api/notifications/history...
+GET SUCCESS
+History count: 3
+Found newly created notification in history:
+{
+  "target": "all_users",
+  "success_count": 0,
+  "id": "htflscSq2chRZf3dsUzN",
+  "data": {
+    "screen": "analytics",
+    "id": "123"
+  },
+  "image_url": "https://example.com/banner.png",
+  "created_at": "2026-02-12T07:05:41.783956+00:00",
+  "sent_at": "2026-02-12T07:05:44.453131+00:00",
+  "failure_count": 116,
+  "title": "Welcome to New Feature!",
+  "status": "sent",
+  "body": "Check out our latest analytics tools."
+}
+
+Verified notification flow successfully.

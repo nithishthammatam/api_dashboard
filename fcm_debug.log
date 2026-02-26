@@ -1,0 +1,74 @@
+
+--- Notification H2mADwBK2Mz7Mpl5HBqr at 2026-02-12 13:04:44.332619 ---
+Tokens: 116
+❌ Batch send error: AttributeError: module 'firebase_admin.messaging' has no attribute 'send_multicast'
+Traceback (most recent call last):
+  File "D:\TimeTrace\dashboard-api-python\routers\notifications.py", line 114, in send_to_all_users
+    response = messaging.send_multicast(message)
+               ^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'firebase_admin.messaging' has no attribute 'send_multicast'
+
+
+--- Notification 1wPy3fCN4SBFTQEV3EMI at 2026-02-12 13:06:42.835620 ---
+Tokens: 117
+❌ Batch send error: AttributeError: module 'firebase_admin.messaging' has no attribute 'send_multicast'
+Traceback (most recent call last):
+  File "D:\TimeTrace\dashboard-api-python\routers\notifications.py", line 114, in send_to_all_users
+    response = messaging.send_multicast(message)
+               ^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'firebase_admin.messaging' has no attribute 'send_multicast'
+
+
+--- Notification hQoeLjeS3V6sTbuNLFDh at 2026-02-12 13:11:00.843612 ---
+Tokens: 117
+❌ Batch send error: AttributeError: module 'firebase_admin.messaging' has no attribute 'send_multicast'
+Traceback (most recent call last):
+  File "D:\TimeTrace\dashboard-api-python\routers\notifications.py", line 114, in send_to_all_users
+    response = messaging.send_multicast(message)
+               ^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'firebase_admin.messaging' has no attribute 'send_multicast'
+
+
+--- Notification Tv7r24JCfGYFFhTN3wa3 at 2026-02-12 13:12:14.591298 ---
+Tokens: 117
+❌ Batch send error: AttributeError: module 'firebase_admin.messaging' has no attribute 'send_multicast'
+Traceback (most recent call last):
+  File "D:\TimeTrace\dashboard-api-python\routers\notifications.py", line 114, in send_to_all_users
+    response = messaging.send_multicast(message)
+               ^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'firebase_admin.messaging' has no attribute 'send_multicast'
+
+
+--- Notification SFgKPXiYmNW445mYSL0b at 2026-02-12 13:16:38.675885 ---
+Tokens: 117
+Batch Result: Success 87, Failure 30
+  - Token index 4 failed: Requested entity was not found.
+  - Token index 11 failed: Requested entity was not found.
+  - Token index 15 failed: Requested entity was not found.
+  - Token index 16 failed: Requested entity was not found.
+  - Token index 21 failed: Requested entity was not found.
+  - Token index 26 failed: Requested entity was not found.
+  - Token index 28 failed: Requested entity was not found.
+  - Token index 29 failed: Requested entity was not found.
+  - Token index 31 failed: Requested entity was not found.
+  - Token index 40 failed: Requested entity was not found.
+  - Token index 42 failed: Requested entity was not found.
+  - Token index 50 failed: Requested entity was not found.
+  - Token index 56 failed: Requested entity was not found.
+  - Token index 57 failed: Requested entity was not found.
+  - Token index 60 failed: Requested entity was not found.
+  - Token index 63 failed: Requested entity was not found.
+  - Token index 64 failed: Requested entity was not found.
+  - Token index 68 failed: Requested entity was not found.
+  - Token index 73 failed: Requested entity was not found.
+  - Token index 74 failed: Requested entity was not found.
+  - Token index 75 failed: Requested entity was not found.
+  - Token index 78 failed: Requested entity was not found.
+  - Token index 83 failed: Requested entity was not found.
+  - Token index 84 failed: Requested entity was not found.
+  - Token index 88 failed: Requested entity was not found.
+  - Token index 91 failed: Requested entity was not found.
+  - Token index 96 failed: Requested entity was not found.
+  - Token index 97 failed: Requested entity was not found.
+  - Token index 107 failed: Requested entity was not found.
+  - Token index 116 failed: Requested entity was not found.

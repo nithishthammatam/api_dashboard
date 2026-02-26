@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from routers import dashboard, notifications
 import os
 import certifi
@@ -22,7 +23,7 @@ if origins_env:
     origins = [o.strip() for o in origins_env.split(",")]
 else:
     # Default/Warning
-    print("⚠️ ALLOWED_ORIGINS not set - allowing all origins")
+    print("[main] ALLOWED_ORIGINS not set - allowing all origins")
     origins = ["*"]
 
 app.add_middleware(
@@ -33,9 +34,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Compress large JSON payloads to reduce transfer time.
+app.add_middleware(
+    GZipMiddleware,
+    minimum_size=1024,
+    compresslevel=5,
+)
+
 # Include Routes
 app.include_router(dashboard.router)
 app.include_router(notifications.router)
+
 
 @app.get("/", tags=["General"])
 async def root():
@@ -50,6 +59,7 @@ async def root():
         }
     }
 
+
 @app.get("/health", tags=["General"])
 async def health_check():
     return {
@@ -57,6 +67,7 @@ async def health_check():
         "status": "healthy",
         "environment": os.getenv("RAILWAY_ENVIRONMENT_NAME", "development")
     }
+
 
 if __name__ == "__main__":
     import uvicorn
