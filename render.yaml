@@ -9,7 +9,7 @@ services:
       - key: PORT
         value: 10000
       - key: PYTHON_VERSION
-        value: 3.9.18
+        value: 3.11.9
       - key: ALLOWED_ORIGINS
         value: "*"
       # You must add these manually in the Render Dashboard (Sensitive Data)
