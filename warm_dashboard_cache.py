@@ -5,6 +5,7 @@ from typing import List
 
 from database.firebase import db, init_error
 from routers.dashboard import (
+    build_user_activity_index,
     get_all_users,
     get_user_status,
     get_screentime,
@@ -14,6 +15,7 @@ from routers.dashboard import (
     get_dau_trend,
     get_stickiness,
     get_new_vs_returning,
+    getGrowthFunnel,
     get_session_summary,
     getPeakUsageHeatmap,
     getSessionDurationDistribution,
@@ -54,12 +56,23 @@ async def _warm_all(days: int, weeks_list: List[int], top_limit: int):
         f"today={today_str}, days={days}, weeks={weeks_list}, top_limit={top_limit}"
     )
 
+    try:
+        index_stats = build_user_activity_index()
+        print(
+            "[warm-dashboard] user activity index "
+            f"users={index_stats.get('indexed_users', 0)}, "
+            f"docs_scanned={index_stats.get('docs_scanned', 0)}"
+        )
+    except Exception as index_err:
+        print(f"[warm-dashboard] user activity index build failed: {index_err}")
+
     # Core summary endpoints
     await get_summary()
     await get_analytics()
     await get_dau_trend(days)
     await get_stickiness("30d")
     await get_new_vs_returning(days)
+    await getGrowthFunnel(days)
     await get_session_summary(today_str)
 
     # Heavy list endpoints

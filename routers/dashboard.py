@@ -36,11 +36,13 @@ _DASHBOARD_CACHE_TTL_MIN = {
     "dau_trend": 10,
     "stickiness": 10,
     "new_vs_returning": 10,
+    "growth_funnel": 10,
     "session_summary": 5,
     "peak_usage_heatmap": 10,
     "session_duration_distribution": 10,
     "daily_usage_patterns": 10,
     "top_apps": 5,
+    "category_drilldown": 5,
     "user_segments": 5,
     "cohort_retention": 10,
     "wellbeing_report": 10,
@@ -61,6 +63,9 @@ _PREAGG_SCHEMA_VERSION = {
 _PERSISTENT_CACHE_COLLECTION = "dashboard_preagg_cache"
 _PERSISTENT_CACHE_VERSION = 1
 _PERSISTENT_CACHE_MAX_BYTES = 850000
+_USER_ACTIVITY_INDEX_COLLECTION = "dashboard_user_activity_index"
+_USER_ACTIVITY_INDEX_META_DOC = "__meta__"
+_USER_ACTIVITY_INDEX_SCHEMA_VERSION = 1
 
 
 def _normalize_cache_value(value: Any) -> Any:
@@ -290,6 +295,238 @@ def _preagg_set(endpoint_key: str, doc_id: str, payload: Dict[str, Any], meta: O
         print(f"[preagg] SET endpoint={endpoint_key}, doc={doc_id}")
     except Exception as preagg_err:
         print(f"[preagg] write error endpoint={endpoint_key}, doc={doc_id}, error={preagg_err}")
+
+
+def _scan_user_activity_from_dates() -> Tuple[Dict[str, Any], Dict[str, set], int, int]:
+    user_first_seen: Dict[str, Any] = {}
+    user_active_dates: Dict[str, set] = {}
+    docs_scanned = 0
+    screentime_docs = 0
+
+    for date_doc in db.collection_group("dates").select([]).stream():
+        docs_scanned += 1
+
+        parent_doc_ref = date_doc.reference.parent.parent
+        parent_collection = parent_doc_ref.parent if parent_doc_ref else None
+        if not parent_doc_ref or not parent_collection or parent_collection.id != "screentime":
+            continue
+
+        date_str = date_doc.id
+        try:
+            activity_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+
+        screentime_docs += 1
+        user_id = parent_doc_ref.id
+
+        if user_id not in user_active_dates:
+            user_active_dates[user_id] = set()
+        user_active_dates[user_id].add(activity_date)
+
+        first_seen_date = user_first_seen.get(user_id)
+        if first_seen_date is None or activity_date < first_seen_date:
+            user_first_seen[user_id] = activity_date
+
+    return user_first_seen, user_active_dates, docs_scanned, screentime_docs
+
+
+def _persist_user_activity_index(
+    user_first_seen: Dict[str, Any],
+    user_active_dates: Dict[str, set],
+    docs_scanned: int,
+    screentime_docs: int
+) -> int:
+    if not db:
+        return 0
+
+    write_count = 0
+    batch = db.batch()
+    pending_writes = 0
+    batch_limit = 300
+
+    for user_id in sorted(user_first_seen.keys()):
+        first_seen_date = user_first_seen.get(user_id)
+        if first_seen_date is None:
+            continue
+
+        active_dates = user_active_dates.get(user_id, set())
+        active_date_strings = sorted(
+            {
+                d.strftime("%Y-%m-%d")
+                for d in active_dates
+                if d is not None
+            }
+        )
+
+        if not active_date_strings:
+            active_date_strings = [first_seen_date.strftime("%Y-%m-%d")]
+
+        doc_ref = db.collection(_USER_ACTIVITY_INDEX_COLLECTION).document(user_id)
+        batch.set(
+            doc_ref,
+            {
+                "schema_version": _USER_ACTIVITY_INDEX_SCHEMA_VERSION,
+                "first_seen_date": first_seen_date.strftime("%Y-%m-%d"),
+                "active_dates": active_date_strings,
+                "active_days": len(active_date_strings),
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            },
+            merge=True
+        )
+
+        pending_writes += 1
+        write_count += 1
+
+        if pending_writes >= batch_limit:
+            batch.commit()
+            batch = db.batch()
+            pending_writes = 0
+
+    meta_ref = db.collection(_USER_ACTIVITY_INDEX_COLLECTION).document(_USER_ACTIVITY_INDEX_META_DOC)
+    batch.set(
+        meta_ref,
+        {
+            "schema_version": _USER_ACTIVITY_INDEX_SCHEMA_VERSION,
+            "user_count": write_count,
+            "source_docs_scanned": docs_scanned,
+            "source_screentime_docs": screentime_docs,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        },
+        merge=True
+    )
+    pending_writes += 1
+
+    if pending_writes > 0:
+        batch.commit()
+
+    return write_count
+
+
+def _load_user_activity_index() -> Optional[Tuple[Dict[str, Any], Dict[str, set], Dict[str, Any]]]:
+    if not db:
+        return None
+
+    try:
+        index_docs = list(db.collection(_USER_ACTIVITY_INDEX_COLLECTION).stream())
+    except Exception as index_err:
+        print(f"[user-activity-index] read error: {index_err}")
+        return None
+
+    if not index_docs:
+        return None
+
+    user_first_seen: Dict[str, Any] = {}
+    user_active_dates: Dict[str, set] = {}
+    meta_payload: Dict[str, Any] = {}
+
+    for index_doc in index_docs:
+        if index_doc.id == _USER_ACTIVITY_INDEX_META_DOC:
+            meta_payload = index_doc.to_dict() or {}
+            continue
+
+        payload = index_doc.to_dict() or {}
+        if payload.get("schema_version") not in (None, _USER_ACTIVITY_INDEX_SCHEMA_VERSION):
+            continue
+
+        first_seen_raw = str(payload.get("first_seen_date") or "").strip()
+        if not first_seen_raw:
+            continue
+
+        try:
+            first_seen_date = datetime.strptime(first_seen_raw, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+
+        active_dates_raw = payload.get("active_dates", [])
+        active_dates_set = set()
+        if isinstance(active_dates_raw, list):
+            for raw_date in active_dates_raw:
+                date_str = str(raw_date or "").strip()
+                if not date_str:
+                    continue
+                try:
+                    active_dates_set.add(datetime.strptime(date_str, "%Y-%m-%d").date())
+                except ValueError:
+                    continue
+
+        if not active_dates_set:
+            active_dates_set.add(first_seen_date)
+
+        user_id = index_doc.id
+        user_first_seen[user_id] = first_seen_date
+        user_active_dates[user_id] = active_dates_set
+
+    if not user_first_seen:
+        return None
+
+    return user_first_seen, user_active_dates, meta_payload
+
+
+def build_user_activity_index() -> Dict[str, Any]:
+    """
+    Rebuild first_seen + active_dates index from screentime date docs.
+    """
+    if not db:
+        raise RuntimeError(f"Database connection not initialized. Error: {init_error}")
+
+    user_first_seen, user_active_dates, docs_scanned, screentime_docs = _scan_user_activity_from_dates()
+    indexed_users = _persist_user_activity_index(
+        user_first_seen,
+        user_active_dates,
+        docs_scanned,
+        screentime_docs
+    )
+
+    return {
+        "indexed_users": indexed_users,
+        "docs_scanned": docs_scanned,
+        "screentime_docs": screentime_docs,
+    }
+
+
+def _load_or_build_user_activity_index() -> Tuple[Dict[str, Any], Dict[str, set], Dict[str, Any]]:
+    indexed_payload = _load_user_activity_index()
+    if indexed_payload is not None:
+        user_first_seen, user_active_dates, meta_payload = indexed_payload
+        print(
+            "[user-activity-index] HIT "
+            f"users={len(user_first_seen)}, updated_at={meta_payload.get('updated_at')}"
+        )
+        return (
+            user_first_seen,
+            user_active_dates,
+            {
+                "source": "index",
+                "docs_scanned": int(meta_payload.get("source_docs_scanned", 0) or 0),
+                "screentime_docs": int(meta_payload.get("source_screentime_docs", 0) or 0),
+            }
+        )
+
+    print("[user-activity-index] MISS; rebuilding from collection_group('dates')")
+    user_first_seen, user_active_dates, docs_scanned, screentime_docs = _scan_user_activity_from_dates()
+
+    try:
+        indexed_users = _persist_user_activity_index(
+            user_first_seen,
+            user_active_dates,
+            docs_scanned,
+            screentime_docs
+        )
+        print(f"[user-activity-index] REBUILT users={indexed_users}")
+    except Exception as index_write_err:
+        print(f"[user-activity-index] write error: {index_write_err}")
+
+    return (
+        user_first_seen,
+        user_active_dates,
+        {
+            "source": "scan",
+            "docs_scanned": docs_scanned,
+            "screentime_docs": screentime_docs,
+        }
+    )
+
 
 def process_user_stats(doc) -> Dict[str, Any]:
     """Helper function to process a single user's stats for /users endpoint"""
@@ -1669,6 +1906,292 @@ async def get_new_vs_returning(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal Server Error")
+
+@router.get("/getGrowthFunnel", response_model=Dict[str, Any])
+async def getGrowthFunnel(
+    days: int = Query(30, description="Number of days to analyze", ge=1, le=3650)
+):
+    """
+    Growth funnel metrics for newly acquired users and new-vs-veteran behavior split.
+    """
+    try:
+        if not db:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Database connection not initialized. Error: {init_error}"
+            )
+
+        ist_offset = timedelta(hours=5, minutes=30)
+        end_date = (datetime.now(timezone.utc) + ist_offset).date()
+        start_date = end_date - timedelta(days=days - 1)
+        start_date_str = start_date.strftime("%Y-%m-%d")
+        end_date_str = end_date.strftime("%Y-%m-%d")
+
+        cache_key = _build_cache_key(
+            "growth_funnel",
+            {
+                "v": 1,
+                "days": days,
+                "start_date": start_date_str,
+                "end_date": end_date_str,
+            }
+        )
+        cached_response = _cache_get(cache_key)
+        if cached_response is not None:
+            return cached_response
+
+        print(
+            "[getGrowthFunnel] "
+            f"days={days}, start={start_date_str}, end={end_date_str}"
+        )
+
+        def _pct(count_value: int, total_value: int) -> float:
+            if total_value <= 0:
+                return 0.0
+            return round((count_value / total_value) * 100, 1)
+
+        user_first_seen, user_active_dates, activity_index_stats = _load_or_build_user_activity_index()
+        docs_scanned = int(activity_index_stats.get("docs_scanned", 0))
+        screentime_docs = int(activity_index_stats.get("screentime_docs", 0))
+        activity_source = str(activity_index_stats.get("source") or "unknown")
+
+        cohort_user_ids = [
+            user_id
+            for user_id, first_seen_date in user_first_seen.items()
+            if start_date <= first_seen_date <= end_date
+        ]
+        new_users_acquired = len(cohort_user_ids)
+
+        retained_day_1_count = 0
+        retained_week_1_count = 0
+        retained_month_1_count = 0
+
+        first_week_eligible = {day_num: 0 for day_num in range(1, 8)}
+        first_week_retained = {day_num: 0 for day_num in range(1, 8)}
+
+        daily_new_users_map = {}
+        for offset in range(days):
+            date_obj = start_date + timedelta(days=offset)
+            daily_new_users_map[date_obj.strftime("%Y-%m-%d")] = 0
+
+        for user_id in cohort_user_ids:
+            first_seen_date = user_first_seen[user_id]
+            active_dates = user_active_dates.get(user_id, set())
+
+            first_seen_str = first_seen_date.strftime("%Y-%m-%d")
+            daily_new_users_map[first_seen_str] = daily_new_users_map.get(first_seen_str, 0) + 1
+
+            if (first_seen_date + timedelta(days=1)) in active_dates:
+                retained_day_1_count += 1
+
+            if (first_seen_date + timedelta(days=7)) in active_dates:
+                retained_week_1_count += 1
+
+            if (first_seen_date + timedelta(days=30)) in active_dates:
+                retained_month_1_count += 1
+
+            for day_num in range(1, 8):
+                target_date = first_seen_date + timedelta(days=day_num)
+                if target_date > end_date:
+                    continue
+                first_week_eligible[day_num] += 1
+                if target_date in active_dates:
+                    first_week_retained[day_num] += 1
+
+        daily_new_users_payload = []
+        for offset in range(days):
+            date_obj = start_date + timedelta(days=offset)
+            date_key = date_obj.strftime("%Y-%m-%d")
+            daily_new_users_payload.append(
+                {
+                    "date": date_key,
+                    "new_users": int(daily_new_users_map.get(date_key, 0)),
+                }
+            )
+
+        first_week_behavior_payload = []
+        for day_num in range(1, 8):
+            first_week_behavior_payload.append(
+                {
+                    "day": day_num,
+                    "return_rate": _pct(
+                        first_week_retained[day_num],
+                        first_week_eligible[day_num]
+                    ),
+                }
+            )
+
+        active_today_user_ids = [
+            user_id
+            for user_id, active_dates in user_active_dates.items()
+            if end_date in active_dates
+        ]
+
+        new_segment_user_ids: List[str] = []
+        veteran_segment_user_ids: List[str] = []
+        for user_id in active_today_user_ids:
+            first_seen_date = user_first_seen.get(user_id)
+            if not first_seen_date:
+                continue
+
+            tenure_days = (end_date - first_seen_date).days + 1
+            if tenure_days < 7:
+                new_segment_user_ids.append(user_id)
+            elif tenure_days >= 30:
+                veteran_segment_user_ids.append(user_id)
+
+        def _load_user_day_metrics(user_id: str) -> Optional[Dict[str, Any]]:
+            try:
+                date_doc = (
+                    db.collection("screentime")
+                    .document(user_id)
+                    .collection("dates")
+                    .document(end_date_str)
+                    .get()
+                )
+            except Exception as fetch_err:
+                print(f"[getGrowthFunnel] failed day fetch user={user_id}, error={fetch_err}")
+                return None
+
+            if not date_doc.exists:
+                return None
+
+            payload = date_doc.to_dict() or {}
+            (
+                daily_screentime_seconds,
+                apps_used_count,
+                total_sessions,
+                app_seconds,
+                _category_seconds,
+            ) = _aggregate_daily_segment_metrics(payload)
+
+            return {
+                "user_id": user_id,
+                "daily_screentime_seconds": int(daily_screentime_seconds),
+                "apps_used_count": int(apps_used_count),
+                "total_sessions": int(total_sessions),
+                "app_seconds": app_seconds,
+            }
+
+        metric_user_ids = sorted(set(new_segment_user_ids + veteran_segment_user_ids))
+        user_day_metrics: Dict[str, Dict[str, Any]] = {}
+
+        if metric_user_ids:
+            max_workers = min(24, max(4, len(metric_user_ids)))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(_load_user_day_metrics, user_id)
+                    for user_id in metric_user_ids
+                ]
+
+                for future in as_completed(futures):
+                    try:
+                        metric_row = future.result()
+                    except Exception as metric_err:
+                        print(f"[getGrowthFunnel] metric aggregation failed: {metric_err}")
+                        continue
+
+                    if not metric_row:
+                        continue
+                    user_day_metrics[str(metric_row["user_id"])] = metric_row
+
+        def _build_segment_payload(user_ids: List[str], definition: str) -> Dict[str, Any]:
+            total_screentime = 0
+            total_apps_used = 0
+            total_sessions = 0
+            app_totals: Dict[str, int] = {}
+            metric_rows = 0
+
+            for user_id in user_ids:
+                metric_row = user_day_metrics.get(user_id)
+                if not metric_row:
+                    continue
+
+                metric_rows += 1
+                total_screentime += int(metric_row.get("daily_screentime_seconds", 0))
+                total_apps_used += int(metric_row.get("apps_used_count", 0))
+                total_sessions += int(metric_row.get("total_sessions", 0))
+
+                for app_name, app_seconds in (metric_row.get("app_seconds") or {}).items():
+                    if not app_name:
+                        continue
+                    app_totals[app_name] = app_totals.get(app_name, 0) + int(app_seconds)
+
+            avg_screentime_seconds = (
+                int(round(total_screentime / metric_rows))
+                if metric_rows > 0
+                else 0
+            )
+            avg_apps_used = (
+                round(total_apps_used / metric_rows, 1)
+                if metric_rows > 0
+                else 0.0
+            )
+            avg_sessions = (
+                round(total_sessions / metric_rows, 1)
+                if metric_rows > 0
+                else 0.0
+            )
+            top_app = _pick_top_key(app_totals)
+
+            return {
+                "definition": definition,
+                "count": len(user_ids),
+                "avg_screentime_formatted": _format_hh_mm_duration(avg_screentime_seconds),
+                "avg_apps_used": avg_apps_used,
+                "avg_sessions": avg_sessions,
+                "top_app": top_app,
+            }
+
+        response_payload = {
+            "period": f"last_{days}_days",
+            "funnel": {
+                "new_users_acquired": new_users_acquired,
+                "retained_day_1": {
+                    "count": retained_day_1_count,
+                    "percent": _pct(retained_day_1_count, new_users_acquired),
+                },
+                "retained_week_1": {
+                    "count": retained_week_1_count,
+                    "percent": _pct(retained_week_1_count, new_users_acquired),
+                },
+                "retained_month_1": {
+                    "count": retained_month_1_count,
+                    "percent": _pct(retained_month_1_count, new_users_acquired),
+                },
+            },
+            "daily_new_users": daily_new_users_payload,
+            "first_week_behavior": first_week_behavior_payload,
+            "new_vs_veteran_comparison": {
+                "new_users": _build_segment_payload(
+                    new_segment_user_ids,
+                    "Active < 7 days"
+                ),
+                "veterans": _build_segment_payload(
+                    veteran_segment_user_ids,
+                    "Active 30+ days"
+                ),
+            },
+        }
+
+        print(
+            "[getGrowthFunnel] "
+            f"users={len(user_first_seen)}, cohort_users={new_users_acquired}, "
+            f"source={activity_source}, docs_scanned={docs_scanned}, "
+            f"screentime_docs={screentime_docs}"
+        )
+
+        _cache_set(cache_key, response_payload, _DASHBOARD_CACHE_TTL_MIN["growth_funnel"])
+        return response_payload
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[getGrowthFunnel] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
 
 @router.get("/session-summary")
 async def get_session_summary(
@@ -3292,6 +3815,477 @@ async def getTopApps(
         raise
     except Exception as e:
         print(f"[getTopApps] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+@router.get("/getCategoryDrilldown", response_model=Dict[str, Any])
+async def getCategoryDrilldown(
+    category: str = Query(..., description="Category filter (for example: Social)"),
+    days: int = Query(30, description="Number of days to analyze", ge=1, le=3650)
+):
+    """
+    Category-focused drilldown across summary, app mix, daily trend, and peak time blocks.
+    """
+    try:
+        if not db:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Database connection not initialized. Error: {init_error}"
+            )
+
+        normalized_category = (category or "").strip()
+        if not normalized_category:
+            raise HTTPException(status_code=400, detail="category is required")
+        category_filter = normalized_category.lower()
+
+        end_date = datetime.now(timezone.utc).date()
+        start_date = end_date - timedelta(days=days - 1)
+        start_date_str = start_date.strftime("%Y-%m-%d")
+        end_date_str = end_date.strftime("%Y-%m-%d")
+
+        cache_key = _build_cache_key(
+            "category_drilldown",
+            {
+                "v": 1,
+                "category": category_filter,
+                "days": days,
+                "start_date": start_date_str,
+                "end_date": end_date_str,
+            }
+        )
+        cached_response = _cache_get(cache_key)
+        if cached_response is not None:
+            return cached_response
+
+        print(
+            "[getCategoryDrilldown] "
+            f"category={normalized_category}, days={days}, "
+            f"start={start_date_str}, end={end_date_str}"
+        )
+
+        def _seconds_from_ms(ms_value: int) -> int:
+            if ms_value <= 0:
+                return 0
+            return int(round(ms_value / 1000.0))
+
+        def _percent(part: int, total: int, precision: int = 1) -> float:
+            if total <= 0:
+                return 0.0
+            return round((part / total) * 100, precision)
+
+        def _trend_label(current_value: int, previous_value: int) -> str:
+            if previous_value <= 0:
+                if current_value <= 0:
+                    return "stable"
+                return "increasing"
+            change_percent = ((current_value - previous_value) / previous_value) * 100.0
+            if change_percent > 1.0:
+                return "increasing"
+            if change_percent < -1.0:
+                return "decreasing"
+            return "stable"
+
+        block_order = [
+            "Late Night 12-6am",
+            "Morning 6-9am",
+            "Late Morning 9am-12pm",
+            "Afternoon 12-3pm",
+            "Late Afternoon 3-6pm",
+            "Evening 6-9pm",
+            "Night 9pm-12am",
+        ]
+        block_sessions = {label: 0 for label in block_order}
+
+        def _hour_to_block(hour: int) -> str:
+            if 6 <= hour < 9:
+                return "Morning 6-9am"
+            if 9 <= hour < 12:
+                return "Late Morning 9am-12pm"
+            if 12 <= hour < 15:
+                return "Afternoon 12-3pm"
+            if 15 <= hour < 18:
+                return "Late Afternoon 3-6pm"
+            if 18 <= hour < 21:
+                return "Evening 6-9pm"
+            if 21 <= hour < 24:
+                return "Night 9pm-12am"
+            return "Late Night 12-6am"
+
+        split_date = start_date + timedelta(days=days // 2)
+        new_apps_cutoff = end_date - timedelta(days=min(days - 1, 6))
+
+        category_total_seconds = 0
+        category_total_sessions = 0
+
+        category_user_ids = set()
+        category_user_ids_today = set()
+        dau_user_ids_today = set()
+
+        app_aggregates: Dict[str, Dict[str, Any]] = {}
+        daily_category_seconds: Dict[str, int] = {}
+        daily_app_seconds: Dict[str, Dict[str, int]] = {}
+
+        docs_scanned = 0
+        docs_in_range = 0
+
+        try:
+            user_docs = list(db.collection("users").select([]).stream())
+        except Exception:
+            user_docs = list(db.collection("users").stream())
+
+        user_ids = [doc.id for doc in user_docs]
+        if not user_ids:
+            try:
+                user_ids = [doc.id for doc in db.collection("screentime").select([]).stream()]
+            except Exception:
+                user_ids = [doc.id for doc in db.collection("screentime").stream()]
+
+        print(f"[getCategoryDrilldown] candidate_users={len(user_ids)}")
+
+        def _aggregate_user_category(user_id: str) -> Dict[str, Any]:
+            user_result: Dict[str, Any] = {
+                "user_id": user_id,
+                "category_total_seconds": 0,
+                "category_total_sessions": 0,
+                "category_active": False,
+                "category_today_active": False,
+                "dau_today_active": False,
+                "docs_scanned": 0,
+                "docs_in_range": 0,
+                "app_aggregates": {},
+                "daily_category_seconds": {},
+                "daily_app_seconds": {},
+                "block_sessions": {label: 0 for label in block_order},
+            }
+
+            try:
+                date_docs = _fetch_user_dates_in_range(user_id, start_date_str, end_date_str)
+            except Exception as user_err:
+                print(f"[getCategoryDrilldown] date fetch failed user={user_id}, error={user_err}")
+                return user_result
+
+            for date_doc in date_docs:
+                user_result["docs_scanned"] += 1
+                date_str = date_doc.id
+
+                try:
+                    date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+
+                payload = date_doc.to_dict() or {}
+                app_rows = _get_app_rows(payload)
+
+                day_has_any_usage = False
+                day_has_category_usage = False
+                day_category_total_seconds = 0
+
+                for app in app_rows:
+                    screen_time_ms = _safe_int(app.get("totalScreenTime"), default=0)
+                    session_count = _safe_int(app.get("sessionCount"), default=0)
+
+                    if screen_time_ms < 0:
+                        screen_time_ms = 0
+                    if session_count < 0:
+                        session_count = 0
+
+                    if screen_time_ms > 0 or session_count > 0:
+                        day_has_any_usage = True
+
+                    app_category = str(app.get("category") or "Unknown").strip() or "Unknown"
+                    if app_category.lower() != category_filter:
+                        continue
+
+                    if screen_time_ms <= 0 and session_count <= 0:
+                        continue
+
+                    user_result["category_active"] = True
+                    day_has_category_usage = True
+
+                    screen_time_seconds = _seconds_from_ms(screen_time_ms)
+                    user_result["category_total_seconds"] += screen_time_seconds
+                    user_result["category_total_sessions"] += session_count
+                    day_category_total_seconds += screen_time_seconds
+
+                    app_name = str(app.get("appName") or "").strip()
+                    package_name = str(app.get("packageName") or "").strip()
+                    display_name = app_name or package_name or "Unknown App"
+                    app_key = f"{display_name}||{package_name or display_name}"
+
+                    if app_key not in user_result["app_aggregates"]:
+                        user_result["app_aggregates"][app_key] = {
+                            "app_name": display_name,
+                            "total_seconds": 0,
+                            "total_sessions": 0,
+                            "previous_window_seconds": 0,
+                            "current_window_seconds": 0,
+                            "first_seen": None,
+                        }
+
+                    app_row = user_result["app_aggregates"][app_key]
+                    app_row["total_seconds"] += screen_time_seconds
+                    app_row["total_sessions"] += session_count
+
+                    first_seen = app_row.get("first_seen")
+                    if first_seen is None or date_obj < first_seen:
+                        app_row["first_seen"] = date_obj
+
+                    if date_obj >= split_date:
+                        app_row["current_window_seconds"] += screen_time_seconds
+                    else:
+                        app_row["previous_window_seconds"] += screen_time_seconds
+
+                    if date_str not in user_result["daily_app_seconds"]:
+                        user_result["daily_app_seconds"][date_str] = {}
+                    user_result["daily_app_seconds"][date_str][display_name] = (
+                        user_result["daily_app_seconds"][date_str].get(display_name, 0)
+                        + screen_time_seconds
+                    )
+
+                    last_used_ms = _safe_int(app.get("lastUsedTime"), default=-1)
+                    if last_used_ms >= 0 and session_count > 0:
+                        try:
+                            event_hour = datetime.fromtimestamp(
+                                last_used_ms / 1000.0,
+                                tz=timezone.utc
+                            ).hour
+                            block_name = _hour_to_block(event_hour)
+                            user_result["block_sessions"][block_name] += session_count
+                        except Exception:
+                            pass
+
+                if not day_has_any_usage:
+                    fallback_total_ms = _safe_int(payload.get("totalScreenTime"), default=0)
+                    fallback_sessions = _safe_int(payload.get("totalSessions"), default=0)
+                    if fallback_total_ms > 0 or fallback_sessions > 0:
+                        day_has_any_usage = True
+
+                if date_obj == end_date and day_has_any_usage:
+                    user_result["dau_today_active"] = True
+
+                if day_has_category_usage:
+                    user_result["docs_in_range"] += 1
+                    user_result["daily_category_seconds"][date_str] = (
+                        user_result["daily_category_seconds"].get(date_str, 0)
+                        + day_category_total_seconds
+                    )
+                    if date_obj == end_date:
+                        user_result["category_today_active"] = True
+
+            return user_result
+
+        if user_ids:
+            max_workers = min(24, max(4, len(user_ids)))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(_aggregate_user_category, user_id)
+                    for user_id in user_ids
+                ]
+
+                for future in as_completed(futures):
+                    try:
+                        user_row = future.result()
+                    except Exception as user_future_err:
+                        print(f"[getCategoryDrilldown] user aggregation failed: {user_future_err}")
+                        continue
+
+                    user_id = str(user_row.get("user_id") or "")
+                    docs_scanned += int(user_row.get("docs_scanned", 0))
+                    docs_in_range += int(user_row.get("docs_in_range", 0))
+                    category_total_seconds += int(user_row.get("category_total_seconds", 0))
+                    category_total_sessions += int(user_row.get("category_total_sessions", 0))
+
+                    if user_id and bool(user_row.get("category_active")):
+                        category_user_ids.add(user_id)
+                    if user_id and bool(user_row.get("category_today_active")):
+                        category_user_ids_today.add(user_id)
+                    if user_id and bool(user_row.get("dau_today_active")):
+                        dau_user_ids_today.add(user_id)
+
+                    local_apps = user_row.get("app_aggregates", {})
+                    for app_key, local_app in local_apps.items():
+                        if app_key not in app_aggregates:
+                            app_aggregates[app_key] = {
+                                "app_name": str(local_app.get("app_name") or "Unknown App"),
+                                "total_seconds": 0,
+                                "total_sessions": 0,
+                                "user_ids": set(),
+                                "previous_window_seconds": 0,
+                                "current_window_seconds": 0,
+                                "first_seen": None,
+                            }
+
+                        global_app = app_aggregates[app_key]
+                        global_app["total_seconds"] += int(local_app.get("total_seconds", 0))
+                        global_app["total_sessions"] += int(local_app.get("total_sessions", 0))
+                        global_app["previous_window_seconds"] += int(
+                            local_app.get("previous_window_seconds", 0)
+                        )
+                        global_app["current_window_seconds"] += int(
+                            local_app.get("current_window_seconds", 0)
+                        )
+
+                        if user_id:
+                            global_app["user_ids"].add(user_id)
+
+                        local_first_seen = local_app.get("first_seen")
+                        global_first_seen = global_app.get("first_seen")
+                        if local_first_seen and (
+                            global_first_seen is None or local_first_seen < global_first_seen
+                        ):
+                            global_app["first_seen"] = local_first_seen
+
+                    for date_str, day_seconds in (user_row.get("daily_category_seconds") or {}).items():
+                        daily_category_seconds[date_str] = (
+                            daily_category_seconds.get(date_str, 0) + int(day_seconds)
+                        )
+
+                    for date_str, app_map in (user_row.get("daily_app_seconds") or {}).items():
+                        if date_str not in daily_app_seconds:
+                            daily_app_seconds[date_str] = {}
+
+                        merged_map = daily_app_seconds[date_str]
+                        for app_name, app_seconds in (app_map or {}).items():
+                            merged_map[app_name] = merged_map.get(app_name, 0) + int(app_seconds)
+
+                    for block_label, block_count in (user_row.get("block_sessions") or {}).items():
+                        if block_label not in block_sessions:
+                            block_sessions[block_label] = 0
+                        block_sessions[block_label] += int(block_count)
+
+        sorted_apps = sorted(
+            app_aggregates.values(),
+            key=lambda row: row["total_seconds"],
+            reverse=True
+        )
+
+        apps_payload = []
+        for app_row in sorted_apps[:10]:
+            app_users = len(app_row["user_ids"])
+            avg_time_seconds = (
+                int(round(app_row["total_seconds"] / app_users))
+                if app_users > 0
+                else 0
+            )
+
+            apps_payload.append(
+                {
+                    "app_name": app_row["app_name"],
+                    "share_of_category": _percent(app_row["total_seconds"], category_total_seconds),
+                    "avg_time_formatted": _format_hh_mm_duration(avg_time_seconds),
+                    "trend": _trend_label(
+                        app_row["current_window_seconds"],
+                        app_row["previous_window_seconds"]
+                    ),
+                }
+            )
+
+        trend_app_names = [row["app_name"] for row in sorted_apps[:5]]
+        trend_payload = []
+        for offset in range(days):
+            day = start_date + timedelta(days=offset)
+            day_str = day.strftime("%Y-%m-%d")
+            day_total_seconds = daily_category_seconds.get(day_str, 0)
+            day_app_map = daily_app_seconds.get(day_str, {})
+
+            day_apps_payload = []
+            for app_name in trend_app_names:
+                app_day_seconds = int(day_app_map.get(app_name, 0))
+                if app_day_seconds <= 0 or day_total_seconds <= 0:
+                    continue
+                day_apps_payload.append(
+                    {
+                        "app_name": app_name,
+                        "share": _percent(app_day_seconds, day_total_seconds),
+                    }
+                )
+
+            day_apps_payload = sorted(
+                day_apps_payload,
+                key=lambda row: row["share"],
+                reverse=True
+            )
+            trend_payload.append(
+                {
+                    "date": day_str,
+                    "apps": day_apps_payload,
+                }
+            )
+
+        total_block_sessions = sum(block_sessions.values())
+        peak_hours_payload = []
+        if total_block_sessions > 0:
+            for block_label in block_order:
+                block_total = int(block_sessions.get(block_label, 0))
+                if block_total <= 0:
+                    continue
+                peak_hours_payload.append(
+                    {
+                        "time_block": block_label,
+                        "percent": int(round((block_total / total_block_sessions) * 100)),
+                    }
+                )
+
+            peak_hours_payload = sorted(
+                peak_hours_payload,
+                key=lambda row: row["percent"],
+                reverse=True
+            )
+
+        users_in_category = len(category_user_ids)
+        avg_time_seconds = (
+            int(round(category_total_seconds / users_in_category))
+            if users_in_category > 0
+            else 0
+        )
+        avg_sessions_per_user = (
+            round(category_total_sessions / users_in_category, 1)
+            if users_in_category > 0
+            else 0.0
+        )
+
+        new_apps_added = sum(
+            1
+            for app_row in app_aggregates.values()
+            if app_row.get("first_seen") and app_row["first_seen"] >= new_apps_cutoff
+        )
+
+        response_payload = {
+            "category": normalized_category,
+            "period": f"last_{days}_days",
+            "summary": {
+                "unique_users_today": len(category_user_ids_today),
+                "percent_of_dau": _percent(len(category_user_ids_today), len(dau_user_ids_today)),
+                "avg_time_seconds": avg_time_seconds,
+                "avg_time_formatted": _format_hh_mm_duration(avg_time_seconds),
+                "avg_sessions_per_user": avg_sessions_per_user,
+                "apps_in_category": len(app_aggregates),
+                "new_apps_added": int(new_apps_added),
+            },
+            "apps": apps_payload,
+            "trend": trend_payload,
+            "peak_hours": peak_hours_payload,
+        }
+
+        print(
+            "[getCategoryDrilldown] "
+            f"apps={len(app_aggregates)}, users={users_in_category}, "
+            f"docs_in_range={docs_in_range}, docs_scanned={docs_scanned}"
+        )
+
+        _cache_set(
+            cache_key,
+            response_payload,
+            _DASHBOARD_CACHE_TTL_MIN["category_drilldown"]
+        )
+        return response_payload
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[getCategoryDrilldown] Error: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal Server Error")
