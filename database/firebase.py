@@ -43,14 +43,26 @@ def initialize_firebase():
 
         token_uri = os.getenv("FIREBASE_TOKEN_URI", "https://oauth2.googleapis.com/token")
 
-        # Handle escaped newlines (common in .env files)
+        # --- Robust private key normalization for Render/Railway ---
+        # Strip surrounding quotes Render may add
+        private_key = private_key.strip().strip('"').strip("'")
+
+        # Case 1: Escaped \n in env var (most common on Render)
         if "\\n" in private_key:
-             print("   Refining private key (replacing \\n with newlines)")
-             private_key = private_key.replace("\\n", "\n")
-        
-        # Ensure correct header/footer
+            print("   Refining private key (replacing \\n with newlines)")
+            private_key = private_key.replace("\\n", "\n")
+
+        # Case 2: All on one line - reconstruct PEM newlines
+        if "-----BEGIN PRIVATE KEY-----" in private_key and "\n" not in private_key:
+            print("   Refining private key (reconstructing PEM newlines)")
+            private_key = (
+                private_key
+                .replace("-----BEGIN PRIVATE KEY-----", "-----BEGIN PRIVATE KEY-----\n")
+                .replace("-----END PRIVATE KEY-----", "\n-----END PRIVATE KEY-----")
+            )
+
         if "-----BEGIN PRIVATE KEY-----" not in private_key:
-             print("[firebase] WARNING: Private key missing header")
+            print("[firebase] WARNING: Private key missing header")
 
         cred = credentials.Certificate({
             "type": "service_account",
