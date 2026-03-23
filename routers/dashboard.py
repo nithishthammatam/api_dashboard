@@ -5487,9 +5487,6 @@ from middleware.auth import verify_api_key
 import firebase_admin.auth as auth
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-]
-)
-
 # Authentication Helper
 async def verify_user(request: Request):
     auth_header = request.headers.get('Authorization')
