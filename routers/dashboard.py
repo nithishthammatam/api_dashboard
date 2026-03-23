@@ -5886,9 +5886,6 @@ from typing import Dict, Any, List, Optional
 from database.firebase import db
 from middleware.auth import verify_api_key
 
-]
-)
-
 def format_duration(seconds: float) -> str:
     hours = int(seconds // 3600)
     mins = int((seconds % 3600) // 60)
@@ -6105,9 +6102,6 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, List
 from database.firebase import db
 from middleware.auth import verify_api_key
-
-]
-)
 
 def parse_last_used_hour(val: Any) -> int:
     if not val:
@@ -6330,9 +6324,6 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, List
 from database.firebase import db
 from middleware.auth import verify_api_key
-
-]
-)
 
 def format_duration(seconds: float) -> str:
     hours = int(seconds // 3600)
@@ -6576,13 +6567,10 @@ from pydantic import BaseModel
 from google.cloud.firestore_v1.base_query import FieldFilter
 import firebase_admin.auth as auth
 
-]
-)
-
 # Optional Firebase JWT verifier if you are passing Firebase User Tokens. 
 # Alternatively, since we use `verify_api_key` globally for this dashboard, we can just grab role/clientId from headers/query.
 # For full compatibility with the prompt, we simulate the verifyUser logic.
-async function_helper_verify_user(request: Request):
+async def function_helper_verify_user(request: Request):
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith('Bearer '):
         # Fallback to pure API-Key mode (Assume Admin) if no JWT
