@@ -46,7 +46,7 @@ app.include_router(dashboard.router)
 app.include_router(notifications.router)
 
 
-@app.get("/", tags=["General"])
+@app.api_route("/", methods=["GET", "HEAD"], tags=["General"])
 async def root():
     return {
         "success": True,
