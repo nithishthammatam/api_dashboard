@@ -7121,7 +7121,7 @@ async def export_all_data(
 ):
     """
     Comprehensive data aggregation for the Reports page.
-    Fetches data from all core dashboard modules for offline export.
+    Fetches data from ALL core dashboard modules for offline export.
     """
     try:
         user_info = await verify_user(request)
@@ -7130,43 +7130,64 @@ async def export_all_data(
         
         target_client = assigned_client_id if role == "client" else None
 
-        # 1. Fetch Summary
+        # 1. Fetch Summary & Lifecycle
         summary = await get_dashboard_summary(request, date)
+        funnel = await get_growth_funnel(request)
         
-        # 2. Fetch DAU Trend
+        # 2. Fetch DAU & Engagement Trends
         dau_trend = await get_dau_trend(request, days=30)
+        usage_patterns = await get_screens_time_patterns(request)
         
-        # 3. Fetch App Intelligence
-        top_apps = await get_top_apps(request, days=7, limit=50)
+        # 3. Fetch App Intelligence & Categories
+        top_apps = await get_top_apps(request, days=7, limit=100)
+        categories = await get_category_drilldown(request, category="Social", days=30)
         
-        # 4. Fetch User Segments
+        # 4. Fetch User Segments & Archetypes
         user_segments = await get_user_segments(request, date)
         
-        # 5. Fetch Signal Metrics for active users
+        # 5. Fetch Signal Metrics for active users (AFI/SCS/RLI)
         bulk_signals = await get_bulk_signal_metrics(date, userIds)
 
-        # 6. Fetch Alerts
-        alerts_res = await get_alerts(request, status="all", limit=100)
+        # 6. Fetch Alerts & Rules
+        alerts_res = await get_alerts(request, status="all", limit=500)
+        rules = await get_manage_alert_rules(request)
         
-        # 7. Fetch Retention
+        # 7. Fetch Retention & Stickiness
         retention = await get_cohort_retention(request)
+        stickiness = await get_stickiness_trend(request, days=30)
 
-        # 8. Fetch Wellbeing
+        # 8. Fetch Wellbeing & Behavioral Flow
         wellbeing = await get_wellbeing_report(request, date)
+        
+        # Generate the consolidated report payload
+        report_data = {
+            "metadata": {
+                "generated_by": user_info["uid"],
+                "snapshot_date": date,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "pages_covered": 15,
+                "version": "1.0.1"
+            },
+            "sheets": {
+                "Dashboard_Summary": summary,
+                "Growth_Funnel": funnel,
+                "DAU_30D_Trend": dau_trend,
+                "Active_Usage_Patterns": usage_patterns,
+                "Competitive_App_Intel": top_apps,
+                "Category_Drilldown": categories,
+                "User_Segment_Matrix": user_segments,
+                "AFI_SCS_Signal_Metrics": bulk_signals,
+                "System_Alerts_Log": alerts_res.get("alerts", []),
+                "Alert_Config_Rules": rules,
+                "Cohort_Retention_Data": retention,
+                "Platform_Stickiness": stickiness,
+                "Wellbeing_Audit": wellbeing
+            }
+        }
 
         return {
             "success": True,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "data": {
-                "summary": summary,
-                "dau_trend": dau_trend,
-                "app_intelligence": top_apps,
-                "user_segments": user_segments,
-                "bulk_signal_metrics": bulk_signals,
-                "alerts": alerts_res.get("alerts", []),
-                "retention": retention,
-                "digital_wellbeing": wellbeing
-            }
+            "data": report_data
         }
     except Exception as e:
         print(f"❌ Error in exportAllData: {e}")
