@@ -5570,9 +5570,7 @@ def get_all_dates_in_range(start_str: str, end_str: str) -> List[str]:
     return dates
 
 def fetch_period_data(start_str: str, end_str: str, active_client_id: Optional[str]) -> Dict[str, Any]:
-    query = db.collection_group("dates") \
-        .where("__name__", ">=", start_str) \
-        .where("__name__", "<=", end_str)
+    query = db.collection_group("dates")
 
     if active_client_id:
          query = query.where("clientId", "==", active_client_id)
@@ -5587,6 +5585,8 @@ def fetch_period_data(start_str: str, end_str: str, active_client_id: Optional[s
 
     for doc in docs:
         date_str = doc.id
+        if not (start_str <= date_str <= end_str):
+             continue
         user_id = doc.reference.parent.parent.id
         
         data = doc.to_dict() or {}
@@ -6128,7 +6128,7 @@ async def get_screentime_patterns(days: int = Query(30)):
         cutoff_dt = today_dt - timedelta(days=days)
         cutoff_str = cutoff_dt.strftime("%Y-%m-%d")
 
-        query = db.collection_group("dates").where("__name__", ">=", cutoff_str)
+        query = db.collection_group("dates")
         docs = query.stream()
 
         # Data structures
@@ -6155,9 +6155,10 @@ async def get_screentime_patterns(days: int = Query(30)):
         # Pickup/putdown stats
         first_pickup_hours = []
         last_use_hours = []
-        
         for doc in docs:
             date_str = doc.id
+            if date_str < cutoff_str:
+                continue
             user_id = doc.reference.parent.parent.id
             
             if date_str not in daily_users:
