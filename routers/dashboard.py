@@ -7124,49 +7124,45 @@ async def export_all_data(
     Fetches data from ALL core dashboard modules for offline export.
     """
     try:
-        user_info = await verify_user(request)
-        role = user_info["role"]
-        assigned_client_id = user_info["clientId"]
+        # Perform authentication check
+        await verify_user(request)
         
-        target_client = assigned_client_id if role == "client" else None
-
         # 1. Fetch Summary & Lifecycle
-        summary = await get_dashboard_summary(request, date)
-        funnel = await get_growth_funnel(request)
+        summary = await get_summary(date=date)
+        funnel = await getGrowthFunnel()
         
         # 2. Fetch DAU & Engagement Trends
-        dau_trend = await get_dau_trend(request, days=30)
-        usage_patterns = await get_screens_time_patterns(request)
+        dau_trend = await get_dau_trend(days=30)
+        usage_patterns = await get_screentime_patterns(days=30) # Fixed name
         
         # 3. Fetch App Intelligence & Categories
-        top_apps = await get_top_apps(request, days=7, limit=100)
-        categories = await get_category_drilldown(request, category="Social", days=30)
+        top_apps = await getTopApps(days=7, limit=100)
+        categories = await getCategoryDrilldown(category="Social", days=30)
         
         # 4. Fetch User Segments & Archetypes
-        user_segments = await get_user_segments(request, date)
+        user_segments = await getUserSegments(date=date)
         
         # 5. Fetch Signal Metrics for active users (AFI/SCS/RLI)
-        bulk_signals = await get_bulk_signal_metrics(date, userIds)
+        bulk_signals = await get_bulk_signal_metrics(date=date, userIds=userIds)
 
         # 6. Fetch Alerts & Rules
-        alerts_res = await get_alerts(request, status="all", limit=500)
-        rules = await get_manage_alert_rules(request)
+        alerts_res = await get_alerts(request=request, status="all", limit=500)
+        rules = await get_manage_alert_rules(request=request)
         
         # 7. Fetch Retention & Stickiness
-        retention = await get_cohort_retention(request)
-        stickiness = await get_stickiness_trend(request, days=30)
+        retention = await getCohortRetention()
+        stickiness = await get_stickiness(days=30)
 
         # 8. Fetch Wellbeing & Behavioral Flow
-        wellbeing = await get_wellbeing_report(request, date)
+        wellbeing = await getWellbeingReport(date=date)
         
         # Generate the consolidated report payload
         report_data = {
             "metadata": {
-                "generated_by": user_info["uid"],
                 "snapshot_date": date,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "pages_covered": 15,
-                "version": "1.0.1"
+                "version": "1.0.2"
             },
             "sheets": {
                 "Dashboard_Summary": summary,
@@ -7191,6 +7187,7 @@ async def export_all_data(
         }
     except Exception as e:
         print(f"❌ Error in exportAllData: {e}")
+        # Log the specific error to help debugging
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
