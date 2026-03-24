@@ -40,11 +40,17 @@ class CacheManager:
             redis_password = os.getenv("REDIS_PASSWORD", None)
 
             if redis_url:
+                # Upstash uses rediss:// (TLS). Convert redis:// → rediss:// if needed
+                if redis_url.startswith("redis://") and "upstash.io" in redis_url:
+                    redis_url = redis_url.replace("redis://", "rediss://", 1)
+                    print("[cache] Upstash detected - upgrading to TLS (rediss://)")
+
                 self.redis_client = redis.from_url(
                     redis_url,
                     decode_responses=True,
-                    socket_connect_timeout=2,
-                    socket_timeout=2,
+                    socket_connect_timeout=5,
+                    socket_timeout=5,
+                    ssl_cert_reqs=None,  # Allow self-signed certs on Upstash
                 )
                 print("[cache] redis connection configured via REDIS_URL")
             else:
