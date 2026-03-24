@@ -7112,3 +7112,64 @@ async def schedule_report(request: Request, payload: ScheduleReportRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail="Internal Server Error")
+
+@router.get("/exportAllData")
+async def export_all_data(
+    request: Request,
+    date: str = Query(..., description="Date (YYYY-MM-DD)"),
+    userIds: Optional[str] = Query(None, description="Optional filter by user IDs")
+):
+    """
+    Comprehensive data aggregation for the Reports page.
+    Fetches data from all core dashboard modules for offline export.
+    """
+    try:
+        user_info = await verify_user(request)
+        role = user_info["role"]
+        assigned_client_id = user_info["clientId"]
+        
+        target_client = assigned_client_id if role == "client" else None
+
+        # 1. Fetch Summary
+        summary = await get_dashboard_summary(request, date)
+        
+        # 2. Fetch DAU Trend
+        dau_trend = await get_dau_trend(request, days=30)
+        
+        # 3. Fetch App Intelligence
+        top_apps = await get_top_apps(request, days=7, limit=50)
+        
+        # 4. Fetch User Segments
+        user_segments = await get_user_segments(request, date)
+        
+        # 5. Fetch Signal Metrics for active users
+        bulk_signals = await get_bulk_signal_metrics(date, userIds)
+
+        # 6. Fetch Alerts
+        alerts_res = await get_alerts(request, status="all", limit=100)
+        
+        # 7. Fetch Retention
+        retention = await get_cohort_retention(request)
+
+        # 8. Fetch Wellbeing
+        wellbeing = await get_wellbeing_report(request, date)
+
+        return {
+            "success": True,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "data": {
+                "summary": summary,
+                "dau_trend": dau_trend,
+                "app_intelligence": top_apps,
+                "user_segments": user_segments,
+                "bulk_signal_metrics": bulk_signals,
+                "alerts": alerts_res.get("alerts", []),
+                "retention": retention,
+                "digital_wellbeing": wellbeing
+            }
+        }
+    except Exception as e:
+        print(f"❌ Error in exportAllData: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Internal Server Error")
