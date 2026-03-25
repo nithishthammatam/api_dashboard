@@ -868,18 +868,19 @@ async def get_sessions(
         print(f"❌ Error fetching sessions: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
-def process_user_analytics(doc, today_str, week_ago_str, month_ago_str):
+def process_user_analytics(doc, today_str, week_ago_str, month_ago_str, quarter_ago_str=None):
     """
     Helper function to process a single user's analytics.
     Returns a dictionary with stats for this user contributed to global totals.
     """
     # Initialize per-user counters
     user_stats = {
-        "users_today": 0, "users_week": 0, "users_month": 0, "user_has_data": False,
+        "users_today": 0, "users_week": 0, "users_month": 0, "users_quarter": 0, "user_has_data": False,
         "total_sessions_all": 0, "total_screentime_all": 0,
         "total_sessions_today": 0, "total_screentime_today": 0,
         "total_sessions_week": 0, "total_screentime_week": 0,
         "total_sessions_month": 0, "total_screentime_month": 0,
+        "total_sessions_quarter": 0, "total_screentime_quarter": 0,
         "new_users_today": 0,
         "synced_sessions_today": 0, "synced_screentime_today": 0
     }
@@ -967,6 +968,7 @@ def process_user_analytics(doc, today_str, week_ago_str, month_ago_str):
         user_active_today = False
         user_active_week = False
         user_active_month = False
+        user_active_quarter = False
         
         for date_id, metrics in date_map.items():
             date_st = metrics["st"]
@@ -1000,6 +1002,13 @@ def process_user_analytics(doc, today_str, week_ago_str, month_ago_str):
                 user_stats["total_screentime_month"] += date_st
                 if date_sess > 0 or date_st > 0:
                     user_active_month = True
+
+            # Quarter (90 Days)
+            if quarter_ago_str and date_id >= quarter_ago_str:
+                user_stats["total_sessions_quarter"] += date_sess
+                user_stats["total_screentime_quarter"] += date_st
+                if date_sess > 0 or date_st > 0:
+                    user_active_quarter = True
         
         # Consistent Active User Logic: Data OR New User
         if new_user_today:
@@ -1008,6 +1017,14 @@ def process_user_analytics(doc, today_str, week_ago_str, month_ago_str):
             user_active_week = True
         if new_user_month:
             user_active_month = True
+        
+        # Consistent logic for quarter as well (any activity in window)
+        user_created_ist = user_created_utc + ist_offset if user_created_utc else None
+        month_ist_start = today_ist_start - timedelta(days=29)
+        quarter_ist_start = today_ist_start - timedelta(days=89)
+        
+        if user_created_ist and user_created_ist >= quarter_ist_start:
+             user_active_quarter = True
 
         if user_active_today:
             user_stats["users_today"] = 1
@@ -1015,6 +1032,8 @@ def process_user_analytics(doc, today_str, week_ago_str, month_ago_str):
             user_stats["users_week"] = 1
         if user_active_month:
             user_stats["users_month"] = 1
+        if user_active_quarter:
+            user_stats["users_quarter"] = 1
             
         return user_stats
 
@@ -1052,6 +1071,9 @@ async def get_analytics():
         # Month = Today + 29 past days (Total 30 days).
         month_ago_str = (now - timedelta(days=29)).strftime("%Y-%m-%d")
         
+        # Quarter = Today + 89 past days (Total 90 days).
+        quarter_ago_str = (now - timedelta(days=89)).strftime("%Y-%m-%d")
+        
         # Initialize Global Counters
         total_users = 0
         total_sessions_all = 0
@@ -1068,6 +1090,10 @@ async def get_analytics():
         total_sessions_month = 0
         total_screentime_month = 0
         users_month = 0
+
+        total_sessions_quarter = 0
+        total_screentime_quarter = 0
+        users_quarter = 0
         
         new_users_today = 0
         
@@ -1082,7 +1108,7 @@ async def get_analytics():
         with ThreadPoolExecutor(max_workers=5) as executor:
             # Pass read-only date strings to avoid datetime sharing issues
             future_to_user = {
-                executor.submit(process_user_analytics, doc, today_str, week_ago_str, month_ago_str): doc 
+                executor.submit(process_user_analytics, doc, today_str, week_ago_str, month_ago_str, quarter_ago_str): doc 
                 for doc in docs
             }
             
@@ -1107,6 +1133,10 @@ async def get_analytics():
                     total_sessions_month += stats["total_sessions_month"]
                     total_screentime_month += stats["total_screentime_month"]
                     users_month += stats["users_month"]
+
+                    total_sessions_quarter += stats["total_sessions_quarter"]
+                    total_screentime_quarter += stats["total_screentime_quarter"]
+                    users_quarter += stats["users_quarter"]
                     
                     new_users_today += stats["new_users_today"]
                     
@@ -1118,7 +1148,7 @@ async def get_analytics():
         hours_today = total_screentime_today / (1000 * 60 * 60) if total_screentime_today > 0 else 0
         hours_week = total_screentime_week / (1000 * 60 * 60) if total_screentime_week > 0 else 0
         hours_month = total_screentime_month / (1000 * 60 * 60) if total_screentime_month > 0 else 0
-        hours_month = total_screentime_month / (1000 * 60 * 60) if total_screentime_month > 0 else 0
+        hours_quarter = total_screentime_quarter / (1000 * 60 * 60) if total_screentime_quarter > 0 else 0
         
         response_payload = {
             "success": True,
@@ -1145,6 +1175,11 @@ async def get_analytics():
                     "totalSessions": total_sessions_month,
                     "activeUsers": users_month,
                     "activeHours": round(hours_month, 2)
+                },
+                "lastQuarter": {
+                    "totalSessions": total_sessions_quarter,
+                    "activeUsers": users_quarter,
+                    "activeHours": round(hours_quarter, 2)
                 }
             },
             "metadata": {
@@ -3450,11 +3485,11 @@ async def getDailyUsagePatterns(
 async def getTopApps(
     days: int = Query(30, description="Number of days to analyze", ge=1, le=3650),
     limit: int = Query(10, description="Number of top apps to return", ge=1, le=200),
-    category: str = Query("all", description="Category filter, or 'all'")
+    category: str = Query("all", description="Category filter, or 'all'"),
+    date: Optional[str] = Query(None, description="Specific date (YYYY-MM-DD) for single day analysis")
 ):
     """
-    Analyze top apps by usage from:
-    screentime/{userId}/dates/{dateString}
+    Analyze top apps by usage. Supports date range (via days) or single day (via date).
     """
     try:
         if not db:
@@ -3466,18 +3501,28 @@ async def getTopApps(
         normalized_category = (category or "all").strip() or "all"
         category_filter = normalized_category.lower()
 
-        end_date = datetime.now(timezone.utc).date()
-        start_date = end_date - timedelta(days=days - 1)
-        start_date_str = start_date.strftime("%Y-%m-%d")
-        end_date_str = end_date.strftime("%Y-%m-%d")
+        if date:
+            start_date_str = date
+            end_date_str = date
+            try:
+                start_date = datetime.strptime(date, "%Y-%m-%d").date()
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+            end_date = start_date
+        else:
+            end_date = datetime.now(timezone.utc).date()
+            start_date = end_date - timedelta(days=days - 1)
+            start_date_str = start_date.strftime("%Y-%m-%d")
+            end_date_str = end_date.strftime("%Y-%m-%d")
 
         cache_key = _build_cache_key(
             "top_apps",
             {
-                "v": 3,
+                "v": 4,
                 "days": days,
                 "limit": limit,
                 "category": category_filter,
+                "date": date,
                 "start_date": start_date_str,
                 "end_date": end_date_str,
             }
@@ -3846,6 +3891,20 @@ async def getCategoryDrilldown(
         if not normalized_category:
             raise HTTPException(status_code=400, detail="category is required")
         category_filter = normalized_category.lower()
+        
+        # Category Grouping Mapping for broader analysis
+        category_groups = {
+            "social": ["social", "communication"],
+            "streaming": ["video", "entertainment", "video_players", "video_players_and_editors"],
+            "gaming": ["game", "games", "game_board", "arcade", "action", "adventure", "casual", "puzzle", "strategy", "simulation", "sports"],
+            "productivity": ["productivity", "tools", "business", "education"],
+            "shopping": ["shopping", "lifestyle"],
+            "finance": ["finance"],
+            "travel": ["travel", "travel_and_local", "maps_and_navigation", "navigation"],
+            "health": ["health", "health_and_fitness", "medical"],
+            "news": ["news", "news_and_magazines", "books", "books_and_reference"]
+        }
+        category_list = category_groups.get(category_filter, [category_filter])
 
         end_date = datetime.now(timezone.utc).date()
         start_date = end_date - timedelta(days=days - 1)
@@ -3855,7 +3914,7 @@ async def getCategoryDrilldown(
         cache_key = _build_cache_key(
             "category_drilldown",
             {
-                "v": 1,
+                "v": 3,
                 "category": category_filter,
                 "days": days,
                 "start_date": start_date_str,
@@ -4002,7 +4061,7 @@ async def getCategoryDrilldown(
                         day_has_any_usage = True
 
                     app_category = str(app.get("category") or "Unknown").strip() or "Unknown"
-                    if app_category.lower() != category_filter:
+                    if app_category.lower() not in category_list:
                         continue
 
                     if screen_time_ms <= 0 and session_count <= 0:
@@ -4315,7 +4374,8 @@ def _get_app_rows(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _aggregate_daily_segment_metrics(
-    payload: Dict[str, Any]
+    payload: Dict[str, Any],
+    category_filter: str = "all"
 ) -> Tuple[int, int, int, Dict[str, int], Dict[str, int]]:
     app_rows = _get_app_rows(payload)
 
@@ -4340,6 +4400,9 @@ def _aggregate_daily_segment_metrics(
         display_name = app_name or package_name
         app_key = package_name or app_name
         category = str(app.get("category") or "Unknown").strip() or "Unknown"
+
+        if category_filter != "all" and category.lower() != category_filter.lower():
+            continue
 
         if app_key:
             seen_apps.add(app_key)
@@ -4419,7 +4482,8 @@ def _aggregate_user_segment_history(
     user_id: str,
     start_date_str: str,
     end_date_str: str,
-    target_date_str: str
+    target_date_str: str,
+    category_filter: str = "all"
 ) -> Dict[str, Any]:
     user_result: Dict[str, Any] = {
         "user_id": user_id,
@@ -4444,7 +4508,7 @@ def _aggregate_user_segment_history(
             total_sessions,
             app_seconds,
             category_seconds,
-        ) = _aggregate_daily_segment_metrics(payload)
+        ) = _aggregate_daily_segment_metrics(payload, category_filter)
 
         user_result["active_dates"].add(date_str)
         user_result["daily_seconds_by_date"][date_str] = daily_screentime_seconds
@@ -4458,12 +4522,34 @@ def _aggregate_user_segment_history(
                 "category_seconds": category_seconds,
             }
 
+def _aggregate_user_period_metrics(
+    user_data: Dict[str, Any],
+    trend_dates_str: List[str]
+) -> Dict[str, Any]:
+    active_in_period = [d for d in trend_dates_str if d in user_data.get("active_dates", set())]
+    if not active_in_period:
+        return None
+        
+    daily_seconds = user_data.get("daily_seconds_by_date", {})
+    total_seconds = sum(daily_seconds.get(d, 0) for d in active_in_period)
+    avg_seconds = total_seconds / len(active_in_period)
+    
+    # We could also aggregate top apps/categories over the period here if needed
+    # but for now let's focus on the primary classification metrics
+    return {
+        "avg_screentime_seconds": int(avg_seconds),
+        "days_active": len(active_in_period),
+        "is_active_today": trend_dates_str[-1] in user_data.get("active_dates", set())
+    }
+
     return user_result
 
 
 @router.get("/getUserSegments", response_model=Dict[str, Any])
 async def getUserSegments(
-    date: Optional[str] = Query("today", description="Target date ('today' or YYYY-MM-DD)")
+    date: Optional[str] = Query("today", description="Target date ('today' or YYYY-MM-DD)"),
+    days: int = Query(30, description="Trend window days"),
+    category: str = Query("all", description="App category filter")
 ):
     """
     Segment active users for a target day by screentime and decline risk.
@@ -4478,32 +4564,41 @@ async def getUserSegments(
         target_date = _resolve_user_segments_date(date)
         target_date_str = target_date.strftime("%Y-%m-%d")
 
-        trend_days = 30
+        trend_days = days
         trend_start_date = target_date - timedelta(days=trend_days - 1)
         trend_start_date_str = trend_start_date.strftime("%Y-%m-%d")
 
-        # At-risk requires two 7-day windows, so include 13 earlier days.
-        history_start_date = trend_start_date - timedelta(days=13)
+        # Define extra windows for summaries (7, 30, 90)
+        seven_days_start_str = (target_date - timedelta(days=6)).strftime("%Y-%m-%d")
+        thirty_days_start_str = (target_date - timedelta(days=29)).strftime("%Y-%m-%d")
+        ninety_days_start_str = (target_date - timedelta(days=89)).strftime("%Y-%m-%d")
+
+        # History fetch should cover max window (at least 90 days) + 14 days for at-risk
+        max_lookback = max(days, 90)
+        history_start_date = target_date - timedelta(days=max_lookback + 13)
         history_start_date_str = history_start_date.strftime("%Y-%m-%d")
 
         cache_key = _build_cache_key(
             "user_segments",
             {
-                "v": 1,
+                "v": 4, # incremented version
                 "date": target_date_str,
                 "trend_days": trend_days,
                 "history_start": history_start_date_str,
+                "category": category
             }
         )
         cached_response = _cache_get(cache_key)
         if cached_response is not None:
             return cached_response
 
-        preagg_doc_id = target_date_str
-        preagg_response = _preagg_get("user_segments", preagg_doc_id)
-        if preagg_response is not None:
-            _cache_set(cache_key, preagg_response, _DASHBOARD_CACHE_TTL_MIN["user_segments"])
-            return preagg_response
+        # Step 3: Check precomputed (only for default 30-day window and 'all' category)
+        if days == 30 and category == "all":
+            preagg_doc_id = target_date_str
+            preagg_response = _preagg_get("user_segments", preagg_doc_id)
+            if preagg_response is not None:
+                _cache_set(cache_key, preagg_response, _DASHBOARD_CACHE_TTL_MIN["user_segments"])
+                return preagg_response
 
         try:
             user_docs = list(db.collection("users").select([]).stream())
@@ -4533,6 +4628,7 @@ async def getUserSegments(
                         history_start_date_str,
                         target_date_str,
                         target_date_str,
+                        category
                     )
                     for user_id in user_ids
                 ]
@@ -4578,59 +4674,64 @@ async def getUserSegments(
             for day in trend_dates
         }
 
-        dau = 0
+        trend_dates_str = [d.strftime("%Y-%m-%d") for d in trend_dates]
 
         for user_data in user_histories:
             active_dates = user_data.get("active_dates", set())
             daily_seconds_by_date = user_data.get("daily_seconds_by_date", {})
 
-            if target_date_str in active_dates:
-                target_metrics = user_data.get("target_metrics") or {
-                    "daily_screentime_seconds": int(daily_seconds_by_date.get(target_date_str, 0)),
-                    "apps_used_count": 0,
-                    "total_sessions": 0,
-                    "app_seconds": {},
-                    "category_seconds": {},
-                }
-
-                decline_percent = _compute_decline_percent(daily_seconds_by_date, target_date)
-                is_at_risk = decline_percent is not None and decline_percent > 30.0
-
-                if is_at_risk:
-                    target_segment = "at_risk"
+            # For persona cards/table: 
+            # If days > 1, we look at period-wide behavior.
+            # If days == 1, we look at target date only.
+            
+            period_metrics = _aggregate_user_period_metrics(user_data, trend_dates_str)
+            if period_metrics:
+                # Decide which metrics to use for classification
+                if trend_days > 1:
+                    screentime_for_class = period_metrics["avg_screentime_seconds"]
+                    # Use target metrics for per-user detail if active today, else average? 
+                    # Let's use target metrics if available, fallback to average
+                    base_metrics = user_data.get("target_metrics") or {
+                        "daily_screentime_seconds": period_metrics["avg_screentime_seconds"],
+                        "apps_used_count": 0,
+                        "total_sessions": 0,
+                        "app_seconds": {},
+                        "category_seconds": {},
+                    }
                 else:
-                    target_segment = _classify_daily_segment(
-                        int(target_metrics.get("daily_screentime_seconds", 0))
-                    )
+                    if target_date_str not in active_dates:
+                        # Continue to trends processing
+                        pass
+                    else:
+                        base_metrics = user_data.get("target_metrics")
+                        screentime_for_class = int(base_metrics.get("daily_screentime_seconds", 0))
 
-                dau += 1
-                target_stats = segment_stats[target_segment]
-                target_stats["count"] += 1
-                target_stats["screentime_total"] += int(
-                    target_metrics.get("daily_screentime_seconds", 0)
-                )
-                target_stats["apps_total"] += int(target_metrics.get("apps_used_count", 0))
-                target_stats["sessions_total"] += int(target_metrics.get("total_sessions", 0))
+                if (trend_days > 1) or (target_date_str in active_dates):
+                    decline_percent = _compute_decline_percent(daily_seconds_by_date, target_date)
+                    is_at_risk = decline_percent is not None and decline_percent > 30.0
 
-                for app_name, app_seconds in (target_metrics.get("app_seconds") or {}).items():
-                    if not app_name:
-                        continue
-                    target_stats["app_seconds"][app_name] = (
-                        target_stats["app_seconds"].get(app_name, 0) + int(app_seconds)
-                    )
+                    if is_at_risk:
+                        target_segment = "at_risk"
+                    else:
+                        target_segment = _classify_daily_segment(screentime_for_class)
 
-                for category_name, category_total in (
-                    target_metrics.get("category_seconds") or {}
-                ).items():
-                    if not category_name:
-                        continue
-                    target_stats["category_seconds"][category_name] = (
-                        target_stats["category_seconds"].get(category_name, 0)
-                        + int(category_total)
-                    )
+                    dau += 1
+                    target_stats = segment_stats[target_segment]
+                    target_stats["count"] += 1
+                    target_stats["screentime_total"] += int(base_metrics.get("daily_screentime_seconds", 0))
+                    target_stats["apps_total"] += int(base_metrics.get("apps_used_count", 0))
+                    target_stats["sessions_total"] += int(base_metrics.get("total_sessions", 0))
 
-                if is_at_risk and decline_percent is not None:
-                    target_stats["declines"].append(float(decline_percent))
+                    for app_name, app_sec in (base_metrics.get("app_seconds") or {}).items():
+                        if app_name:
+                            target_stats["app_seconds"][app_name] = target_stats["app_seconds"].get(app_name, 0) + int(app_sec)
+
+                    for cat_name, cat_total in (base_metrics.get("category_seconds") or {}).items():
+                        if cat_name:
+                            target_stats["category_seconds"][cat_name] = target_stats["category_seconds"].get(cat_name, 0) + int(cat_total)
+
+                    if is_at_risk and decline_percent is not None:
+                        target_stats["declines"].append(float(decline_percent))
 
             for trend_day in trend_dates:
                 trend_date_str = trend_day.strftime("%Y-%m-%d")
@@ -4657,28 +4758,86 @@ async def getUserSegments(
                 return 0.0
             return round((count_value / dau_value) * 100, 1)
 
-        segments_payload: Dict[str, Dict[str, Any]] = {}
-        for segment_name in segment_order:
-            stats_row = segment_stats[segment_name]
-            count_value = int(stats_row["count"])
-
-            segment_entry: Dict[str, Any] = {
-                "count": count_value,
-                "percent_of_dau": _pct_of_dau(count_value, dau),
-                "threshold": thresholds[segment_name],
-                "avg_screentime_seconds": _avg_or_zero(stats_row["screentime_total"], count_value),
-                "avg_apps_used": _avg_or_zero(stats_row["apps_total"], count_value),
-                "avg_sessions": _avg_or_zero(stats_row["sessions_total"], count_value),
-                "top_app": _pick_top_key(stats_row["app_seconds"]),
-                "top_category": _pick_top_key(stats_row["category_seconds"]),
+        def _compute_segment_stats(histories, start_str, end_str, target_date_obj, cat_filter):
+            """Internal helper to compute segment distribution for a given window"""
+            window_dates = []
+            curr = datetime.strptime(start_str, "%Y-%m-%d").date()
+            while curr <= target_date_obj:
+                window_dates.append(curr.strftime("%Y-%m-%d"))
+                curr += timedelta(days=1)
+            
+            w_dau = 0
+            w_segment_stats = {
+                seg: {
+                    "count": 0, "screentime_total": 0, "apps_total": 0, "sessions_total": 0,
+                    "app_seconds": {}, "category_seconds": {}, "declines": []
+                } for seg in segment_order
             }
 
-            if segment_name == "at_risk":
-                declines = stats_row.get("declines", [])
-                avg_decline = round(sum(declines) / len(declines), 1) if declines else 0.0
-                segment_entry["avg_decline_percent"] = avg_decline
+            for u_data in histories:
+                act_dates = u_data.get("active_dates", set())
+                # If window is > 1 day, use average
+                active_in_w = [d for d in window_dates if d in act_dates]
+                if not active_in_w: continue
+                
+                w_dau += 1
+                daily_stats = u_data.get("daily_seconds_by_date", {})
+                w_avg_st = sum(daily_stats.get(d, 0) for d in active_in_w) / len(active_in_w)
+                
+                # Use target metrics for details if active today, else average
+                b_metrics = u_data.get("target_metrics") or {
+                    "daily_screentime_seconds": int(w_avg_st),
+                    "apps_used_count": 0, "total_sessions": 0,
+                    "app_seconds": {}, "category_seconds": {}
+                }
+                
+                # Check for at-risk (only applies to target date context)
+                d_pct = _compute_decline_percent(daily_stats, target_date_obj)
+                is_risk = d_pct is not None and d_pct > 30.0
+                
+                t_seg = "at_risk" if is_risk else _classify_daily_segment(int(w_avg_st))
+                
+                row = w_segment_stats[t_seg]
+                row["count"] += 1
+                row["screentime_total"] += int(b_metrics.get("daily_screentime_seconds", 0))
+                row["apps_total"] += int(b_metrics.get("apps_used_count", 0))
+                row["sessions_total"] += int(b_metrics.get("total_sessions", 0))
+                
+                for app, sec in (b_metrics.get("app_seconds") or {}).items():
+                    row["app_seconds"][app] = row["app_seconds"].get(app, 0) + int(sec)
+                for cat, sec in (b_metrics.get("category_seconds") or {}).items():
+                    row["category_seconds"][cat] = row["category_seconds"].get(cat, 0) + int(sec)
+                if is_risk and d_pct is not None:
+                    row["declines"].append(float(d_pct))
 
-            segments_payload[segment_name] = segment_entry
+            # Format payload
+            res = {}
+            for s_name in segment_order:
+                sr = w_segment_stats[s_name]
+                cv = int(sr["count"])
+                entry = {
+                    "count": cv,
+                    "percent_of_dau": _pct_of_dau(cv, w_dau),
+                    "threshold": thresholds[s_name],
+                    "avg_screentime_seconds": _avg_or_zero(sr["screentime_total"], cv),
+                    "avg_apps_used": _avg_or_zero(sr["apps_total"], cv),
+                    "avg_sessions": _avg_or_zero(sr["sessions_total"], cv),
+                    "top_app": _pick_top_key(sr["app_seconds"]),
+                    "top_category": _pick_top_key(sr["category_seconds"]),
+                }
+                if s_name == "at_risk":
+                    decs = sr.get("declines", [])
+                    entry["avg_decline_percent"] = round(sum(decs) / len(decs), 1) if decs else 0.0
+                res[s_name] = entry
+            return res, w_dau
+
+        # Original logic for the requested 'days' (current segments)
+        segments_payload, dau = _compute_segment_stats(user_histories, trend_start_date_str, target_date_str, target_date, category)
+        
+        # Additional Summaries for 7, 30, 90 days
+        stats_7d, _ = _compute_segment_stats(user_histories, seven_days_start_str, target_date_str, target_date, category)
+        stats_30d, _ = _compute_segment_stats(user_histories, thirty_days_start_str, target_date_str, target_date, category)
+        stats_90d, _ = _compute_segment_stats(user_histories, ninety_days_start_str, target_date_str, target_date, category)
 
         trend_payload = []
         for trend_day in trend_dates:
@@ -4698,6 +4857,9 @@ async def getUserSegments(
             "date": target_date_str,
             "segments": segments_payload,
             "trend": trend_payload,
+            "summary_7d": stats_7d,
+            "summary_30d": stats_30d,
+            "summary_90d": stats_90d,
         }
 
         _preagg_set(
@@ -5570,54 +5732,51 @@ def get_all_dates_in_range(start_str: str, end_str: str) -> List[str]:
     return dates
 
 def fetch_period_data(start_str: str, end_str: str, active_client_id: Optional[str]) -> Dict[str, Any]:
-    # 1. Fetch relevant users
-    users_ref = db.collection("users")
+    # 1. Fetch relevant users if filtering by client
+    user_ids = None
     if active_client_id:
-        users_ref = users_ref.where("clientId", "==", active_client_id)
+        users_ref = db.collection("users").where("clientId", "==", active_client_id)
+        user_docs = users_ref.select([]).stream()
+        user_ids = {d.id for d in user_docs}
     
-    user_docs = list(users_ref.stream())
-    user_ids = [d.id for d in user_docs]
-    
-    all_docs = []
-    
-    # 2. Fetch date documents concurrently per user
-    # Firestore supports range queries on document_id() inside a collection
-    def fetch_user_dates(uid: str):
-        dates_ref = db.collection("screentime").document(uid).collection("dates")
-        return list(dates_ref.where(FieldPath.document_id(), ">=", start_str)
-                            .where(FieldPath.document_id(), "<=", end_str)
-                            .stream())
-
-    if user_ids:
-        # Use a higher worker count for this batch fetch
-        with ThreadPoolExecutor(max_workers=15) as executor:
-            futures = [executor.submit(fetch_user_dates, uid) for uid in user_ids]
-            for future in as_completed(futures):
-                try:
-                    all_docs.extend(future.result())
-                except Exception as e:
-                    print(f"[fetch_period_data] Error fetching dates for a user: {e}")
+    # 2. Fetch all date documents. 
+    # Use collection_group consistent with precompute_engine for reliability.
+    # Note: If date range filtering on ID is unreliable in collection_group, 
+    # we filter in memory, which is plenty fast for a few thousand documents.
+    all_docs = db.collection_group("dates").stream()
 
     by_date = {}
     by_user = {}
     app_usage = {}
     category_usage = {}
-    user_first_seen = {}
+    user_first_seen = {} 
+
+    active_user_ids = set()
+    total_screentime = 0
+    total_sessions = 0
 
     for doc in all_docs:
         date_str = doc.id
+        
+        # In-memory range filter for accuracy
+        if date_str < start_str or date_str > end_str:
+            continue
+
         user_id = doc.reference.parent.parent.id
         
+        # Filter by client if necessary
+        if user_ids is not None and user_id not in user_ids:
+            continue
+
+        active_user_ids.add(user_id)
         data = doc.to_dict() or {}
         apps = data.get("apps", [])
         if isinstance(apps, dict):
              apps = list(apps.values())
         
-        # Determine first seen date (estimate from records we have)
         if user_id not in user_first_seen or date_str < user_first_seen[user_id]:
             user_first_seen[user_id] = date_str
 
-        # Ensure structures are initialized
         if date_str not in by_date:
             by_date[date_str] = {"userIds": set(), "sessions": 0, "screentime": 0}
         
@@ -5636,6 +5795,9 @@ def fetch_period_data(start_str: str, end_str: str, active_client_id: Optional[s
             by_date[date_str]["screentime"] += screentime
             by_user[user_id]["totalScreentime"] += screentime
             by_user[user_id]["totalSessions"] += sessions
+            
+            total_screentime += screentime
+            total_sessions += sessions
 
             app_name = app.get("appName")
             if app_name:
@@ -5650,79 +5812,47 @@ def fetch_period_data(start_str: str, end_str: str, active_client_id: Optional[s
                     category_usage[category] = {"totalScreentime": 0}
                 category_usage[category]["totalScreentime"] += screentime
 
-    # Step 3: All dates calculation
     all_dates = get_all_dates_in_range(start_str, end_str)
     period_days = len(all_dates) if len(all_dates) > 0 else 1
 
-    # Step 4: DAU per day
-    dau_per_day = {}
-    for d_str in all_dates:
-        dau_per_day[d_str] = len(by_date[d_str]["userIds"]) if d_str in by_date else 0
-        
+    dau_per_day = {d_str: len(by_date[d_str]["userIds"]) if d_str in by_date else 0 for d_str in all_dates}
     dau_values = list(dau_per_day.values())
     dau_avg = round(sum(dau_values) / len(dau_values)) if dau_values else 0
 
-    # Step 5: MAU
-    all_user_ids = set(user_ids) # Users found initially
-    mau = len(all_user_ids)
+    mau = len(active_user_ids)
+    if not active_client_id and mau == 0 and db:
+         try:
+             # Fast estimation if no activity
+             mau = db.collection("users").count().get()[0][0].value
+         except:
+             mau = 0
 
-    # Step 6: Stickiness
     stickiness = round((dau_avg / mau * 100), 1) if mau > 0 else 0
-
-    # Step 7: Avg session duration
-    total_screentime = sum(d["screentime"] for d in by_date.values())
-    total_sessions = sum(d["sessions"] for d in by_date.values())
     avg_session_seconds = round(total_screentime / total_sessions / 1000) if total_sessions > 0 else 0
 
-    # Step 8: Calculate new users
     total_new_users = sum(1 for uid, first_date in user_first_seen.items() 
                           if start_str <= first_date <= end_str)
     new_users_per_day = round(total_new_users / period_days, 1)
 
-    # Step 9: User segments
-    power_users = 0
-    regular_users = 0
-    casual_users = 0
-    at_risk_count = 0 # Placeholder for complex logic
-
+    power_users = regular_users = casual_users = 0
     for uid, u_data in by_user.items():
-        if len(u_data["dates"]) > 0:
-            user_avg = (u_data["totalScreentime"] / 1000) / len(u_data["dates"])
-            if user_avg > 14400: # 4 hours
-                power_users += 1
-            elif user_avg > 3600: # 1 hour
-                regular_users += 1
-            elif user_avg > 0:
-                casual_users += 1
+        user_avg = (u_data["totalScreentime"] / 1000) / len(u_data["dates"])
+        if user_avg > 14400: power_users += 1
+        elif user_avg > 3600: regular_users += 1
+        else: casual_users += 1
 
-    # Step 10: Retention Day 1 (simplified)
     cohort_size = sum(1 for uid, first_date in user_first_seen.items() if first_date == start_str)
     returned_day1 = 0
     if cohort_size > 0:
         day_1_date = (datetime.strptime(start_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
         returned_day1 = sum(1 for uid, first_date in user_first_seen.items() 
                             if first_date == start_str and uid in by_user and day_1_date in by_user[uid]["dates"])
-                            
     retention_day1 = round((returned_day1 / cohort_size * 100), 1) if cohort_size > 0 else 0
 
-    # Step 11: Top App
-    top_app = "N/A"
-    if app_usage:
-        top_app = max(app_usage.items(), key=lambda x: x[1]["totalScreentime"])[0]
+    top_app = max(app_usage.items(), key=lambda x: x[1]["totalScreentime"])[0] if app_usage else "N/A"
+    top_category = max(category_usage.items(), key=lambda x: x[1]["totalScreentime"])[0] if category_usage else "N/A"
 
-    # Step 12: Top Category
-    top_category = "N/A"
-    if category_usage:
-        top_category = max(category_usage.items(), key=lambda x: x[1]["totalScreentime"])[0]
-
-    # Step 13: DAU Overlay
-    dau_overlay = []
-    for idx, d_str in enumerate(all_dates):
-        dau_overlay.append({
-            "day": idx + 1,
-            "date": d_str,
-            "dau": dau_per_day.get(d_str, 0)
-        })
+    dau_overlay = [{"day": i + 1, "date": d_str, "dau": dau_per_day.get(d_str, 0)} for i, d_str in enumerate(all_dates)]
 
     return {
         "dau_avg": dau_avg,
@@ -5735,7 +5865,7 @@ def fetch_period_data(start_str: str, end_str: str, active_client_id: Optional[s
         "power_users": power_users,
         "regular_users": regular_users,
         "casual_users": casual_users,
-        "at_risk_users": at_risk_count,
+        "at_risk_users": 0,
         "top_app": top_app,
         "top_category": top_category,
         "total_sessions": total_sessions,
@@ -5753,19 +5883,6 @@ async def compare_periods_endpoint(
     period_b_end: str = Query(..., description="YYYY-MM-DD"),
     viewingAs: Optional[str] = Query(None)
 ):
-    print("comparePeriods called", {
-        "period_a": f"{period_a_start} to {period_a_end}",
-        "period_b": f"{period_b_start} to {period_b_end}"
-    })
-
-    # Validate Dates
-    date_regex = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-    if not all(date_regex.match(d) for d in [period_a_start, period_a_end, period_b_start, period_b_end]):
-        raise HTTPException(status_code=400, detail="Dates must be in YYYY-MM-DD format")
-
-    if period_a_end < period_a_start or period_b_end < period_b_start:
-        raise HTTPException(status_code=400, detail="End date must be >= start date")
-
     user_info = await verify_user(request)
     role = user_info["role"]
     assigned_client_id = user_info["clientId"]
@@ -5776,14 +5893,12 @@ async def compare_periods_endpoint(
     elif role == 'admin' and viewingAs:
         active_client_id = viewingAs
 
-    # Fetch Data in Parallel
     with ThreadPoolExecutor(max_workers=2) as executor:
         future_a = executor.submit(fetch_period_data, period_a_start, period_a_end, active_client_id)
         future_b = executor.submit(fetch_period_data, period_b_start, period_b_end, active_client_id)
         period_a_data = future_a.result()
         period_b_data = future_b.result()
 
-    # Compare
     comparison = {}
     metrics_to_compare = [
         ("dau_avg", ""), ("mau", ""), ("stickiness", "%"), 
@@ -5794,7 +5909,6 @@ async def compare_periods_endpoint(
     
     wins = 0
     losses = 0
-    neutral = 0
 
     for metric, suffix in metrics_to_compare:
         val_a = period_a_data[metric]
@@ -5821,7 +5935,6 @@ async def compare_periods_endpoint(
 
         if sentiment == "positive": wins += 1
         elif sentiment == "negative": losses += 1
-        else: neutral += 1
 
     comparison["top_app"] = {
         "period_a": period_a_data["top_app"],
@@ -5837,38 +5950,21 @@ async def compare_periods_endpoint(
         "change_label": "No change" if period_a_data["top_category"] == period_b_data["top_category"] else f"Changed from {period_b_data['top_category']} to {period_a_data['top_category']}"
     }
 
-    # Verdict
-    if wins >= losses * 2: overall_verdict = "significantly_better"
+    if wins == 0 and losses == 0: overall_verdict = "similar"
+    elif wins >= losses * 2: overall_verdict = "significantly_better"
     elif wins > losses: overall_verdict = "slightly_better"
-    elif wins == losses: overall_verdict = "similar"
     elif losses >= wins * 2: overall_verdict = "significantly_worse"
     else: overall_verdict = "slightly_worse"
 
     return {
-        "period_a": {
-            "start": period_a_start,
-            "end": period_a_end,
-            "label": format_label(period_a_start, period_a_end),
-            "days": period_a_data["period_days"]
-        },
-        "period_b": {
-            "start": period_b_start,
-            "end": period_b_end,
-            "label": format_label(period_b_start, period_b_end),
-            "days": period_b_data["period_days"]
-        },
+        "period_a": {"start": period_a_start, "end": period_a_end, "label": format_label(period_a_start, period_a_end), "days": period_a_data["period_days"]},
+        "period_b": {"start": period_b_start, "end": period_b_end, "label": format_label(period_b_start, period_b_end), "days": period_b_data["period_days"]},
         "overall_verdict": overall_verdict,
         "wins": wins,
         "losses": losses,
         "comparison": comparison,
-        "dau_overlay": {
-            "period_a_data": period_a_data["dau_overlay"],
-            "period_b_data": period_b_data["dau_overlay"]
-        },
-        "filter": {
-            "clientId": active_client_id,
-            "role": role
-        }
+        "dau_overlay": {"period_a_data": period_a_data["dau_overlay"], "period_b_data": period_b_data["dau_overlay"]},
+        "filter": {"clientId": active_client_id, "role": role}
     }
 
 # --- FROM user_profile.py ---

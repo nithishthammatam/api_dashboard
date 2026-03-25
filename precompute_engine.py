@@ -83,7 +83,8 @@ def fetch_all_raw_data(days: int = 30) -> Dict[str, Any]:
                 "totalSessions": 0,
                 "recentScreentime": 0,
                 "recentSessions": 0,
-                "recentApps": set()
+                "recentApps": set(),
+                "daily_st": {} # New
             }
         u = by_user[user_id]
         if date_str < u["firstSeen"]:
@@ -91,6 +92,12 @@ def fetch_all_raw_data(days: int = 30) -> Dict[str, Any]:
         if date_str > u["lastSeen"]:
             u["lastSeen"] = date_str
         u["allDates"].add(date_str)
+        
+        # Track daily screentime for windowed calculations
+        day_st = 0
+        for app in apps:
+            day_st += app.get("totalScreenTime", 0)
+        u["daily_st"][date_str] = day_st
 
         is_recent = date_str >= cutoff_str
         if is_recent:
@@ -274,9 +281,38 @@ def compute_user_segments(raw: Dict) -> Dict:
             at_risk += 1
 
     total = power + regular + casual
+    
+    # Compute distributions for 7, 30, 90 days
+    # Note: u["recentDates"] currently contains up to 90 days
+    
+    def _get_dist(days_limit):
+        p = r = c = 0
+        cutoff = (today_dt - timedelta(days=days_limit)).strftime("%Y-%m-%d")
+        for uid, user in by_user.items():
+            win_dates = [d for d in user["recentDates"] if d >= cutoff]
+            if not win_dates: continue
+            avg_ms = sum(user.get("daily_st", {}).get(d, 0) for d in win_dates) / len(win_dates)
+            avg_sec = avg_ms / 1000
+            if avg_sec > 4 * 3600: p += 1
+            elif avg_sec > 1 * 3600: r += 1
+            elif avg_sec > 0: c += 1
+        
+        t = p + r + c
+        if t == 0: return {"power": 0, "regular": 0, "casual": 0, "total": 0}
+        return {
+            "power": p, "regular": r, "casual": c, "total": t,
+            "power_percent": round(p/t*100, 1),
+            "regular_percent": round(r/t*100, 1),
+            "casual_percent": round(c/t*100, 1)
+        }
+
+    stats_7d = _get_dist(7)
+    stats_30d = _get_dist(30)
+    stats_90d = _get_dist(90)
+    
     result = {
         "date": today_str,
-        "power_users": power,
+        "power_users": power, # current (90d average based on runner)
         "regular_users": regular,
         "casual_users": casual,
         "at_risk_users": at_risk,
@@ -284,6 +320,10 @@ def compute_user_segments(raw: Dict) -> Dict:
         "power_percent": round(power / total * 100, 1) if total > 0 else 0,
         "regular_percent": round(regular / total * 100, 1) if total > 0 else 0,
         "casual_percent": round(casual / total * 100, 1) if total > 0 else 0,
+        "summary_7d": stats_7d,
+        "summary_30d": stats_30d,
+        "summary_90d": stats_90d,
+        "period_days": 90
     }
 
     save_to_firestore("analytics_precomputed", f"userSegments_{today_str}", result)
@@ -360,8 +400,8 @@ def run_full_precompute():
     start = datetime.utcnow()
 
     try:
-        # Fetch data once
-        raw = fetch_all_raw_data(days=30)
+        # Fetch data once - increase to 90 days as requested
+        raw = fetch_all_raw_data(days=90)
 
         # Run all computations using the shared raw data
         daily = compute_daily_metrics(raw)
