@@ -56,7 +56,7 @@ _DASHBOARD_CACHE_TTL_MIN = {
 }
 
 _PREAGG_COLLECTIONS = {
-    "user_segments": "dashboard_preagg_user_segments",
+    "user_segments": "analytics_precomputed",
     "cohort_retention": "dashboard_preagg_cohort_retention",
     "wellbeing_report": "dashboard_preagg_wellbeing_report",
 }
@@ -4592,13 +4592,27 @@ async def getUserSegments(
         if cached_response is not None:
             return cached_response
 
-        # Step 3: Check precomputed (only for default 30-day window and 'all' category)
-        if days == 30 and category == "all":
-            preagg_doc_id = target_date_str
+        # Step 3: Check precomputed (only for 'all' category)
+        if category == "all":
+            # The precompute engine saves using a different pattern: userSegments_{date}
+            preagg_doc_id = f"userSegments_{target_date_str}"
             preagg_response = _preagg_get("user_segments", preagg_doc_id)
             if preagg_response is not None:
-                _cache_set(cache_key, preagg_response, _DASHBOARD_CACHE_TTL_MIN["user_segments"])
-                return preagg_response
+                # If specifically looking for 7d, 30d, or 90d, extract the summary
+                if days == 7 and "summary_7d" in preagg_response:
+                    preagg_response["segments"] = preagg_response["summary_7d"]
+                elif days == 30 and "summary_30d" in preagg_response:
+                    preagg_response["segments"] = preagg_response["summary_30d"]
+                elif days == 90 and "summary_90d" in preagg_response:
+                    preagg_response["segments"] = preagg_response["summary_90d"]
+                
+                # If looking for a custom day but precomputed is 30d, maybe just use it?
+                # No, better to recompute if it's a specific custom day.
+                
+                # Check if segments exists in preagg_response before caching
+                if "segments" in preagg_response:
+                    _cache_set(cache_key, preagg_response, _DASHBOARD_CACHE_TTL_MIN["user_segments"])
+                    return preagg_response
 
         try:
             user_docs = list(db.collection("users").select([]).stream())
