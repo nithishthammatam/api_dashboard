@@ -4522,6 +4522,9 @@ def _aggregate_user_segment_history(
                 "category_seconds": category_seconds,
             }
 
+    return user_result
+
+
 def _aggregate_user_period_metrics(
     user_data: Dict[str, Any],
     trend_dates_str: List[str]
@@ -4542,7 +4545,6 @@ def _aggregate_user_period_metrics(
         "is_active_today": trend_dates_str[-1] in user_data.get("active_dates", set())
     }
 
-    return user_result
 
 
 @router.get("/getUserSegments", response_model=Dict[str, Any])
@@ -4690,7 +4692,10 @@ async def getUserSegments(
 
         trend_dates_str = [d.strftime("%Y-%m-%d") for d in trend_dates]
 
+        dau = 0
         for user_data in user_histories:
+            if not user_data:
+                continue
             active_dates = user_data.get("active_dates", set())
             daily_seconds_by_date = user_data.get("daily_seconds_by_date", {})
 
@@ -4789,6 +4794,8 @@ async def getUserSegments(
             }
 
             for u_data in histories:
+                if not u_data:
+                    continue
                 act_dates = u_data.get("active_dates", set())
                 # If window is > 1 day, use average
                 active_in_w = [d for d in window_dates if d in act_dates]
