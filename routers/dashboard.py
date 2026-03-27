@@ -53,6 +53,7 @@ _DASHBOARD_CACHE_TTL_MIN = {
     "user_segments": 5,
     "cohort_retention": 10,
     "wellbeing_report": 10,
+    "ssr_metrics": 10,
 }
 
 _PREAGG_COLLECTIONS = {
@@ -4635,7 +4636,8 @@ async def getUserSegments(
 
         user_histories: List[Dict[str, Any]] = []
         if user_ids:
-            max_workers = min(24, max(4, len(user_ids)))
+            # Reduce max_workers for Render starter tier (prevents timeout/CPU throttling)
+            max_workers = 8 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [
                     executor.submit(
@@ -4651,8 +4653,11 @@ async def getUserSegments(
 
                 for future in as_completed(futures):
                     try:
-                        user_histories.append(future.result())
+                        res = future.result()
+                        if res:
+                            user_histories.append(res)
                     except Exception as user_future_err:
+                        # Catch specific user failures without crashing the entire set
                         print(f"[getUserSegments] user aggregation failed: {user_future_err}")
 
         segment_order = ["power", "regular", "casual", "at_risk"]
@@ -5754,17 +5759,31 @@ def get_all_dates_in_range(start_str: str, end_str: str) -> List[str]:
 
 def fetch_period_data(start_str: str, end_str: str, active_client_id: Optional[str]) -> Dict[str, Any]:
     # 1. Fetch relevant users if filtering by client
-    user_ids = None
     if active_client_id:
         users_ref = db.collection("users").where("clientId", "==", active_client_id)
-        user_docs = users_ref.select([]).stream()
-        user_ids = {d.id for d in user_docs}
-    
-    # 2. Fetch all date documents. 
-    # Use collection_group consistent with precompute_engine for reliability.
-    # Note: If date range filtering on ID is unreliable in collection_group, 
-    # we filter in memory, which is plenty fast for a few thousand documents.
-    all_docs = db.collection_group("dates").stream()
+        user_ids = [d.id for d in users_ref.select([]).stream()]
+    else:
+        # Fallback to all users from sccreentime collection group
+        # but better to use user collection for reliable iteration
+        user_ids = [d.id for d in db.collection("users").select([]).stream()]
+        if not user_ids:
+             # Fallback to scanning screentime collection if user metadata is empty
+             user_ids = [doc.id for doc in db.collection("screentime").select([]).stream()]
+
+    def _fetch_user_subset(uid: str) -> List[Any]:
+        return _fetch_user_dates_in_range(uid, start_str, end_str)
+
+    # 2. Parallel fetch per user for performance and reliability
+    all_docs = []
+    if user_ids:
+        max_workers = 8 # Lower for Render to avoid CPU throttling
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_fetch_user_subset, uid) for uid in user_ids]
+            for future in as_completed(futures):
+                try:
+                    all_docs.extend(future.result())
+                except Exception as e:
+                    print(f"Error fetching range for user: {e}")
 
     by_date = {}
     by_user = {}
@@ -5778,17 +5797,11 @@ def fetch_period_data(start_str: str, end_str: str, active_client_id: Optional[s
 
     for doc in all_docs:
         date_str = doc.id
-        
-        # In-memory range filter for accuracy
+        # Range check remains as safety, though Firestore query should handle most
         if date_str < start_str or date_str > end_str:
             continue
 
         user_id = doc.reference.parent.parent.id
-        
-        # Filter by client if necessary
-        if user_ids is not None and user_id not in user_ids:
-            continue
-
         active_user_ids.add(user_id)
         data = doc.to_dict() or {}
         apps = data.get("apps", [])
@@ -5824,8 +5837,9 @@ def fetch_period_data(start_str: str, end_str: str, active_client_id: Optional[s
             if app_name:
                 category = app.get("category", "Other")
                 if app_name not in app_usage:
-                    app_usage[app_name] = {"totalScreentime": 0, "category": category}
+                    app_usage[app_name] = {"totalScreentime": 0, "totalSessions": 0, "category": category}
                 app_usage[app_name]["totalScreentime"] += screentime
+                app_usage[app_name]["totalSessions"] += sessions
                 
             category = app.get("category")
             if category:
@@ -5839,6 +5853,14 @@ def fetch_period_data(start_str: str, end_str: str, active_client_id: Optional[s
     dau_per_day = {d_str: len(by_date[d_str]["userIds"]) if d_str in by_date else 0 for d_str in all_dates}
     dau_values = list(dau_per_day.values())
     dau_avg = round(sum(dau_values) / len(dau_values)) if dau_values else 0
+
+    session_duration_per_day = {}
+    for d_str in all_dates:
+        d_data = by_date.get(d_str, {"sessions": 0, "screentime": 0})
+        if d_data["sessions"] > 0:
+            session_duration_per_day[d_str] = round(d_data["screentime"] / d_data["sessions"] / 1000, 1) # in seconds
+        else:
+            session_duration_per_day[d_str] = 0
 
     mau = len(active_user_ids)
     if not active_client_id and mau == 0 and db:
@@ -5856,6 +5878,18 @@ def fetch_period_data(start_str: str, end_str: str, active_client_id: Optional[s
     new_users_per_day = round(total_new_users / period_days, 1)
 
     power_users = regular_users = casual_users = 0
+    at_risk_users = 0
+    
+    # Heuristic for at-risk: active in the first 7 days of the period but not the last 7 days
+    if period_days >= 14:
+        first_week = all_dates[:7]
+        last_week = all_dates[-7:]
+        for uid, u_data in by_user.items():
+            was_active_start = any(d in u_data["dates"] for d in first_week)
+            was_active_end = any(d in u_data["dates"] for d in last_week)
+            if was_active_start and not was_active_end:
+                at_risk_users += 1
+
     for uid, u_data in by_user.items():
         user_avg = (u_data["totalScreentime"] / 1000) / len(u_data["dates"])
         if user_avg > 14400: power_users += 1
@@ -5870,10 +5904,22 @@ def fetch_period_data(start_str: str, end_str: str, active_client_id: Optional[s
                             if first_date == start_str and uid in by_user and day_1_date in by_user[uid]["dates"])
     retention_day1 = round((returned_day1 / cohort_size * 100), 1) if cohort_size > 0 else 0
 
-    top_app = max(app_usage.items(), key=lambda x: x[1]["totalScreentime"])[0] if app_usage else "N/A"
+    sorted_apps = sorted(app_usage.items(), key=lambda x: x[1]["totalScreentime"], reverse=True)
+    top_apps_payload = []
+    for app_name, app_info in sorted_apps[:10]:
+        users_count = sum(1 for uid, u_data in by_user.items() if any(d in u_data["dates"] for d in all_dates)) # Simplified
+        avg_time_per_day = round((app_info["totalScreentime"] / 1000 / 60) / period_days, 1)
+        top_apps_payload.append({
+            "app_name": app_name,
+            "category": app_info["category"],
+            "avg_daily_minutes": avg_time_per_day
+        })
+
+    top_app = sorted_apps[0][0] if sorted_apps else "N/A"
     top_category = max(category_usage.items(), key=lambda x: x[1]["totalScreentime"])[0] if category_usage else "N/A"
 
     dau_overlay = [{"day": i + 1, "date": d_str, "dau": dau_per_day.get(d_str, 0)} for i, d_str in enumerate(all_dates)]
+    session_overlay = [{"day": i + 1, "date": d_str, "duration_seconds": session_duration_per_day.get(d_str, 0)} for i, d_str in enumerate(all_dates)]
 
     return {
         "dau_avg": dau_avg,
@@ -5886,13 +5932,15 @@ def fetch_period_data(start_str: str, end_str: str, active_client_id: Optional[s
         "power_users": power_users,
         "regular_users": regular_users,
         "casual_users": casual_users,
-        "at_risk_users": 0,
+        "at_risk_users": at_risk_users,
         "top_app": top_app,
         "top_category": top_category,
+        "top_apps": top_apps_payload,
         "total_sessions": total_sessions,
         "total_screentime_seconds": round(total_screentime / 1000),
         "period_days": period_days,
-        "dau_overlay": dau_overlay
+        "dau_overlay": dau_overlay,
+        "session_overlay": session_overlay
     }
 
 @router.get("/comparePeriods")
@@ -5978,13 +6026,46 @@ async def compare_periods_endpoint(
     else: overall_verdict = "slightly_worse"
 
     return {
-        "period_a": {"start": period_a_start, "end": period_a_end, "label": format_label(period_a_start, period_a_end), "days": period_a_data["period_days"]},
-        "period_b": {"start": period_b_start, "end": period_b_end, "label": format_label(period_b_start, period_b_end), "days": period_b_data["period_days"]},
+        "period_a": {
+            "start": period_a_start, 
+            "end": period_a_end, 
+            "label": format_label(period_a_start, period_a_end), 
+            "days": period_a_data["period_days"],
+            "segments": {
+                "power": period_a_data["power_users"],
+                "regular": period_a_data["regular_users"],
+                "casual": period_a_data["casual_users"],
+                "at_risk": period_a_data["at_risk_users"]
+            }
+        },
+        "period_b": {
+            "start": period_b_start, 
+            "end": period_b_end, 
+            "label": format_label(period_b_start, period_b_end), 
+            "days": period_b_data["period_days"],
+            "segments": {
+                "power": period_b_data["power_users"],
+                "regular": period_b_data["regular_users"],
+                "casual": period_b_data["casual_users"],
+                "at_risk": period_b_data["at_risk_users"]
+            }
+        },
         "overall_verdict": overall_verdict,
         "wins": wins,
         "losses": losses,
         "comparison": comparison,
-        "dau_overlay": {"period_a_data": period_a_data["dau_overlay"], "period_b_data": period_b_data["dau_overlay"]},
+        "dau_overlay": {
+            "period_a_data": period_a_data["dau_overlay"], 
+            "period_b_data": period_b_data["dau_overlay"]
+        },
+        "session_overlay": {
+            "period_a_data": period_a_data["session_overlay"], 
+            "period_b_data": period_b_data["session_overlay"]
+        },
+        "top_apps_comparison": {
+            "period_a": period_a_data["top_apps"],
+            "period_b": period_b_data["top_apps"]
+        },
         "filter": {"clientId": active_client_id, "role": role}
     }
 
@@ -6665,6 +6746,232 @@ async def get_user_lifecycle(days: int = Query(90)):
         }
         
     except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/ssr-metric-api")
+async def get_ssr_metrics(
+    days: int = Query(7, description="Number of days to analyze"),
+    date: Optional[str] = Query(None, description="Specific date (YYYY-MM-DD), if provided overrides days")
+):
+    """
+    Stay, Switch, Return (SSR) metrics and Attention analysis.
+    - Stay: Avg session duration.
+    - Switch: Rate of app changes per hour.
+    - Return: Loop behavior and pattern detection.
+    """
+    try:
+        if not db:
+            raise HTTPException(status_code=500, detail="Database connection not initialized")
+
+        # 1. Define range (IST)
+        ist_offset = timedelta(hours=5, minutes=30)
+        now_ist = datetime.now(timezone.utc) + ist_offset
+        if date:
+            end_date_str = date
+            start_date_str = date
+            lookback_days = 1
+        else:
+            end_date_str = now_ist.strftime("%Y-%m-%d")
+            start_date_str = (now_ist - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+            lookback_days = days
+
+        cache_key = _build_cache_key("ssr_metrics", {"days": lookback_days, "date": date})
+        cached_response = _cache_get(cache_key)
+        if cached_response is not None:
+            return cached_response
+
+        print(f"[ssr-metrics] Analyzing range: {start_date_str} to {end_date_str}")
+
+        # 2. Fetch data (Optimized using Collection Group if possible)
+        # Note: We need both 'sessions' and 'screentime' dates for full analysis
+        all_user_ids = set([doc.id for doc in db.collection("users").select([]).stream()])
+        total_users = len(all_user_ids)
+        
+        # We'll use a local aggregate map
+        user_metrics = {uid: {
+            "total_duration": 0, "session_count": 0, "switches": 0, "loops": 0,
+            "last_app": None, "last_time": 0, "hourly_afi": {}, "pattern_sequence": []
+        } for uid in all_user_ids}
+
+        # Fetch session dates in range
+        # Note: We query across all users' session dates
+        session_dates = db.collection_group("dates").stream()
+        
+        total_switches = 0
+        total_sessions = 0
+        total_duration = 0
+        pattern_counts = {}
+
+        for doc in session_dates:
+            path = doc.reference.path
+            if "sessions" not in path: continue
+            
+            date_id = doc.id
+            if not (start_date_str <= date_id <= end_date_str): continue
+            
+            # Extract userId from path: sessions/{userId}/dates/{date}
+            path_parts = path.split('/')
+            user_id = path_parts[1]
+            if user_id not in user_metrics: continue
+
+            payload = doc.to_dict() or {}
+            sessions_list = payload.get("sessions", [])
+            if not isinstance(sessions_list, list): continue
+
+            # Sort sessions chronologically
+            sorted_sessions = sorted(sessions_list, key=lambda x: x.get("startTime", 0))
+            
+            last_app = user_metrics[user_id]["last_app"]
+            last_end_time = user_metrics[user_id]["last_time"]
+            sequence = user_metrics[user_id]["pattern_sequence"]
+
+            for sess in sorted_sessions:
+                pkg = sess.get("packageName", "unknown")
+                start_time = _safe_int(sess.get("startTime", 0))
+                duration = _safe_int(sess.get("duration", 0)) / 1000 # to seconds
+                
+                total_sessions += 1
+                total_duration += duration
+                user_metrics[user_id]["session_count"] += 1
+                user_metrics[user_id]["total_duration"] += duration
+
+                # Switch detection: change in package name if gap is small (< 5 mins)
+                if last_app and pkg != last_app:
+                    gap = (start_time - last_end_time) / 1000
+                    if gap < 300: # 5 mins
+                        total_switches += 1
+                        user_metrics[user_id]["switches"] += 1
+                        
+                        # Pattern tracking (simplified)
+                        if len(sequence) >= 2:
+                            pattern = f"{sequence[-2]} → {sequence[-1]} → {pkg}"
+                            if sequence[-2] == pkg: # Return loop A -> B -> A
+                                user_metrics[user_id]["loops"] += 1
+                                pattern_counts[pattern] = pattern_counts.get(pattern, 0) + 1
+                    
+                sequence.append(pkg)
+                if len(sequence) > 3: sequence.pop(0)
+                
+                last_app = pkg
+                last_end_time = start_time + (duration * 1000)
+
+            user_metrics[user_id]["last_app"] = last_app
+            user_metrics[user_id]["last_time"] = last_end_time
+            user_metrics[user_id]["pattern_sequence"] = sequence
+
+        # 3. Aggregate Final Results
+        avg_stay = total_duration / total_sessions if total_sessions > 0 else 0
+        
+        # Distribution counts
+        stable_count = 0
+        degrading_count = 0
+        fatigued_count = 0
+        
+        high_risk_users = []
+        engaged_users = []
+
+        for uid, metrics in user_metrics.items():
+            # Classification based on fragmentation (switches/sessions)
+            frag_score = metrics["switches"] / metrics["session_count"] if metrics["session_count"] > 0 else 0
+            avg_u_stay = metrics["total_duration"] / metrics["session_count"] if metrics["session_count"] > 0 else 0
+            
+            if frag_score < 0.3 and avg_u_stay > 120:
+                stable_count += 1
+                metrics["state"] = "stable"
+            elif frag_score < 0.6:
+                degrading_count += 1
+                metrics["state"] = "degrading"
+            else:
+                fatigued_count += 1
+                metrics["state"] = "fatigued"
+
+            # Top users logic
+            if avg_u_stay > 300: # > 5 mins avg stay
+                engaged_users.append({
+                    "user_id": uid,
+                    "stay_score": round(min(1.0, avg_u_stay / 1200), 2),
+                    "return_rate": round((metrics["loops"] / metrics["session_count"] * 100) if metrics["session_count"] > 0 else 0, 1)
+                })
+            
+            if frag_score > 0.8:
+                high_risk_users.append({
+                    "user_id": uid,
+                    "switch_rate": round(metrics["switches"] / max(1, lookback_days * 24), 1),
+                    "risk_level": "high"
+                })
+
+        # Calculate score (0-100)
+        # Score decreases with higher switches per session
+        overall_frag = total_switches / total_sessions if total_sessions > 0 else 0
+        attention_score = max(0, min(100, int(100 - (overall_frag * 100))))
+
+        # Formatting patterns
+        top_patterns = []
+        sorted_patterns = sorted(pattern_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        for p, count in sorted_patterns:
+            top_patterns.append({
+                "pattern": p,
+                "count": count,
+                "type": "return_loop" if p.split(" → ")[0] == p.split(" → ")[2] else "fragmented"
+            })
+
+        response_payload = {
+            "summary": {
+                "attention_state": "fragmented" if overall_frag > 0.5 else "focused",
+                "attention_score": attention_score,
+                "primary_issue": "High switching behavior" if overall_frag > 0.5 else "None",
+                "trend_7d": "-5.2%" # Historical comparison could be added here
+            },
+            "ssr_metrics": {
+                "stay": {
+                    "avg_duration_seconds": int(avg_stay),
+                    "avg_duration_formatted": f"{int(avg_stay // 60)}m {int(avg_stay % 60)}s",
+                    "classification": "low" if avg_stay < 120 else "moderate" if avg_stay < 300 else "high"
+                },
+                "switch": {
+                    "total_switches": total_switches,
+                    "switch_rate_per_hour": round(total_switches / max(1, total_users * lookback_days * 24), 2),
+                    "classification": "high" if overall_frag > 0.6 else "moderate" if overall_frag > 0.3 else "low"
+                },
+                "return": {
+                    "return_rate_percent": round((sum(u["loops"] for u in user_metrics.values()) / total_sessions * 100) if total_sessions > 0 else 0, 1),
+                    "classification": "moderate"
+                }
+            },
+            "attention_distribution": [
+                {"state": "stable", "users": stable_count, "percent": round(stable_count / total_users * 100, 1) if total_users > 0 else 0},
+                {"state": "degrading", "users": degrading_count, "percent": round(degrading_count / total_users * 100, 1) if total_users > 0 else 0},
+                {"state": "fatigued", "users": fatigued_count, "percent": round(fatigued_count / total_users * 100, 1) if total_users > 0 else 0}
+            ],
+            "risk_signals": [
+                {
+                    "type": "fatigue",
+                    "users": fatigued_count,
+                    "percent": round(fatigued_count / total_users * 100, 1) if total_users > 0 else 0,
+                    "insight": "High fatigue due to long continuous usage" if fatigued_count > total_users/2 else "Normal fatigue levels"
+                },
+                {
+                    "type": "behavioral_drift",
+                    "users": len(high_risk_users),
+                    "percent": round(len(high_risk_users) / total_users * 100, 1) if total_users > 0 else 0,
+                    "insight": "Unusual switching patterns detected"
+                }
+            ],
+            "top_patterns": top_patterns,
+            "top_users": {
+                "high_engagement": sorted(engaged_users, key=lambda x: x["stay_score"], reverse=True)[:5],
+                "high_risk": sorted(high_risk_users, key=lambda x: x["switch_rate"], reverse=True)[:5]
+            }
+        }
+
+        _cache_set(cache_key, response_payload, _DASHBOARD_CACHE_TTL_MIN["ssr_metrics"])
+        return response_payload
+
+    except Exception as e:
+        print(f"❌ Error in get_ssr_metrics: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))

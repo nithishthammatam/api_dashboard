@@ -35,17 +35,26 @@ origins_env = os.getenv("ALLOWED_ORIGINS")
 if origins_env:
     origins = [o.strip() for o in origins_env.split(",")]
 else:
-    # Default/Warning
-    print("[main] ALLOWED_ORIGINS not set - allowing all origins")
-    origins = ["*"]
+    # Default: allow common development and production origins if NOT set
+    origins = [
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3000",
+        "https://analytics-dashboard-03.vercel.app", # Example production URL
+    ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
+    allow_origins=origins if origins_env else ["*"],
+    allow_credentials=True if origins_env or origins else False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Note: If origins is ["*"], allow_credentials MUST be False.
+# If you need credentials (Authorization header) and allow all, 
+# you should set allow_origins=["*"] and allow_credentials=False 
+# OR list your origins explicitly.
 
 # Compress large JSON payloads to reduce transfer time.
 app.add_middleware(
